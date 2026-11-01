@@ -235,6 +235,19 @@ const permissionHandler: AcpPermissionHandler = (context) => {
   return { action: "deny" };
 };
 const permissionOptions: AcpPermissionsOptions = { onRequest: permissionHandler, timeoutMs: 10_000 };
+const automaticPermissions: AcpPermissionsOptions = { mode: "auto" };
+const explicitDenyPermissions: AcpPermissionsOptions = { mode: "deny", timeoutMs: 1_000 };
+// @ts-expect-error automatic mode does not accept a callback.
+const mixedAutomaticPermissions: AcpPermissionsOptions = { mode: "auto", onRequest: permissionHandler };
+// @ts-expect-error callback mode does not accept an explicit policy mode.
+const mixedCallbackPermissions: AcpPermissionsOptions = { mode: "deny", onRequest: permissionHandler };
+// @ts-expect-error unknown permission modes are rejected.
+const invalidPermissionMode: AcpPermissionsOptions = { mode: "prompt" };
+void automaticPermissions;
+void explicitDenyPermissions;
+void mixedAutomaticPermissions;
+void mixedCallbackPermissions;
+void invalidPermissionMode;
 const denyPermission: AcpPermissionDecision = { action: "deny" };
 const selectPermission: AcpPermissionDecision = { action: "select", optionId: "allow-once" };
 const permissionContext: AcpPermissionRequestContext = {

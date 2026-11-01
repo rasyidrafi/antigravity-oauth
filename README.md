@@ -9,11 +9,29 @@ still refuses inference without a verified output-token bound; the explicit
 compatibility mode can use the prompt/event pump but does not enforce
 `max_tokens`. Optional Rosetta adapters disclose the exact normalized limit
 and its enforcement outcome out of band; the compatibility path can exceed
-the requested bound. This path is fake-child qualified only; do not claim live
-inference or real enforcement. There is no executable download, public server,
-public inference HTTP API, or CLI-auth import. A local profile is only isolated
-SDK-owned storage and child-process configuration; it is not proof of OAuth or
-keychain isolation.
+the requested bound. Scoped live smoke tests have exercised explicit login in
+two SDK-owned profiles, native text inference and streaming, caller-managed
+tool handoffs across those profiles, and streaming and non-streaming Rosetta
+requests; see [Scoped live verification](#scoped-live-verification). These
+observations do not establish output-token enforcement, broad compatibility,
+or production readiness. There is no executable download, public server,
+public inference HTTP API, or CLI-auth import. A local profile is only
+isolated SDK-owned storage and child-process configuration; it is not proof of
+per-account OAuth or keychain isolation.
+
+> **Dangerous permission default:** For the built-in ACP driver, omitting
+> `permissions` selects automatic approval: on a valid request owned by the
+> active ACP turn it chooses the first offered `allow_always`, or the first
+> offered `allow_once` if no `allow_always` is available. This does not ask the
+> application for a callback or human decision. ACP request origin is
+> unverified, and approval can authorize arbitrary agent-side effects. An
+> `allow_always` grant may outlive this SDK/session. The SDK cannot revoke
+> approval bytes already written or grants already persisted by the ACP agent.
+> This setting does not control any prompting or persistence implemented by
+> the ACP agent.
+> Use `permissions: { mode: "deny" }` to reject permission requests instead.
+> A custom `sessionDriverFactory` owns its permission policy; the built-in
+> default does not configure an injected driver.
 
 ## Runtime requirements and development
 
@@ -22,6 +40,27 @@ keychain isolation.
 - `npm run build` emits ESM and declarations under `dist/`.
 - `npm run typecheck` checks compile-time API assertions.
 - `npm test` builds, typechecks, and runs the Node unit tests.
+
+## Installing this package
+
+This project is not published to the npm registry, so
+`npm install antigravity-oauth-sdk` will not work. After the desired commit
+has been pushed to the public repository, install it from Git:
+
+```sh
+npm install git+https://github.com/rasyidrafi/antigravity-oauth.git
+```
+
+The Git install runs the package's `prepare` lifecycle, which compiles the
+TypeScript source to `dist/`. npm installs the package's build-time
+dependencies for this step; the installed package runs from the generated
+JavaScript and declarations. Lifecycle scripts must be enabled for Git
+installs. With `--ignore-scripts`, `dist/` is not generated and package
+imports will fail. A Git URL only contains commits already pushed to the
+repository; local, unpushed changes are not included.
+
+In a local checkout, `npm install` also runs `prepare` and builds the package;
+run `npm run build` again after editing source files.
 
 The Anthropic SDK is a regular dependency because the public declaration files
 refer to its Messages request, response, and stream-event types. This package
@@ -36,8 +75,7 @@ Messages implementation. Install that package explicitly only if using the
 adapter:
 
 ```sh
-npm install antigravity-oauth-sdk
-npm install --save-exact @zenmux/rosetta-ai@1.0.38
+npm install @zenmux/rosetta-ai@1.0.38
 ```
 
 The optional Responses adapter is a separate `./responses` subpath using that
@@ -55,13 +93,19 @@ import { AntigravitySDK, messageMaxTokensEnforcement } from "antigravity-oauth-s
 
 // maxTokensPolicy is strict when omitted. The built-in ACP driver rejects a
 // Messages prompt unless a hard output-token bound has been established.
-const strictSdk = new AntigravitySDK({ storageDir, executable });
+// Permission omission instead means automatic approval; this example opts out.
+const strictSdk = new AntigravitySDK({
+  storageDir,
+  executable,
+  permissions: { mode: "deny" },
+});
 await strictSdk.close();
 
 const sdk = new AntigravitySDK({
   storageDir,
   executable,
   maxTokensPolicy: "allow-unenforced-max-tokens",
+  permissions: { mode: "deny" },
 });
 const account = sdk.accounts.get(accountId);
 await account.auth.login();
@@ -115,6 +159,10 @@ The built-in driver accepts only the reviewed Antigravity ACP 1.3.0
 executable/companion hash pairs for Linux x64, Windows x64, and macOS ARM64.
 Unknown binaries, missing companions, model selectors without advertised exact
 values, rejected model changes, and unverified model selections fail closed.
+On the Linux x64 host used for the live smoke tests, the official binary also
+needed `args: ["--gid=nogroup"]` because that host had no group named
+`nobody`. This is an environment-specific launch setting, not a universal SDK
+default; check the target host and its binary's requirements before copying it.
 An ACP session with no caller tools starts during
 `account.sessions.create()`. If caller tools are configured, startup initializes
 ACP but delays `session/new` until `session.tools.createMcpServer()` binds that
@@ -146,38 +194,56 @@ establish a per-response output-token bound. The explicit compatibility policy
 below uses the same ACP prompt/event pump without claiming that `max_tokens` is
 enforced.
 
-With no `permissions.onRequest` callback (the default), the ACP driver denies
-permission requests even when the active session ID or opaque metadata looks
-familiar. Well-formed requests select an offered `reject_once` option;
-malformed requests or requests without a valid one-shot option return ACP's
-`cancelled` outcome. An explicitly configured caller callback can approve only
-one structurally valid request belonging to the current live ACP session turn
-(including its parked caller-tool handoff). Its exact selected option must be
-an offered `allow_once`; `allow_always` and `reject_always` are never selected.
-Invalid decisions, exceptions, rejection, and overload deny; timeout or a
-cancelled/changed operation cancels the response. Callback work is capped at
-eight in-flight invocations per SDK, shared across its account sessions.
-When an approved response reaches the outbound ACP FIFO head, the transport
-rechecks the callback deadline and its owning operation/terminal/close state,
-then serializes the selected result immediately before `stdin.write()`. A stale
-approval is replaced by the same request's correlated `cancelled` response (or
-dropped if the transport is no longer writable). Calling `stdin.write()` is the
-byte-commit boundary: once it accepts a frame into Node's writable buffer,
-later cancellation cannot retract those bytes or promise a retroactive denial.
-Internal filesystem, terminal, and unknown client RPC methods remain
-unsupported and are rejected.
+In-memory ACP and loopback MCP fixtures exercise the public SDK's built-in
+caller-tool handoff and result continuation without external account
+credentials. Fixture coverage alone does not prove that the official
+executable or a live model invokes the MCP endpoint. Narrow successful
+official caller-tool flows, including one streamed handoff, are now covered by
+live evidence below across two SDK-owned profiles; this does not qualify
+broader tool, model, account, or platform interoperability.
 
-This is a powerful opt-in: approving an ACP permission can authorize agent-side
-effects for that one request. It does **not** authorize SDK-side caller-tool
-execution, bypass MCP schema/receipt checks, or establish provenance. A
-callback must make its own approval decision for every request and must not
-rely on ACP session IDs, titles, tool kinds, or `_meta` claims as proof of
-origin. Callback detail fields are bounded; the exact bound MCP authorization
-value and bearer token are removed before truncation, while unknown token/URL
-detection is heuristic. Arbitrary model-supplied text cannot be guaranteed
-fully scrubbed. Handlers must not block the JavaScript thread; an elapsed
-monotonic deadline rejects a late decision, but cannot preempt synchronous user
-code while it is running.
+> **Permission safety notice:** The built-in default is automatic approval,
+> not an application callback or human approval step. For a valid permission
+> request owned by the active ACP turn, the SDK selects the first offered
+> `allow_always`, falling back to the
+> first offered `allow_once`. ACP origin is unverified; the request is not
+> proven to come from this SDK's MCP server. Approval can authorize arbitrary
+> agent-side effects, and `allow_always` may persist beyond the SDK or session.
+> Cancellation cannot retract approval bytes already written or grants already
+> persisted by the ACP agent. The SDK has no API to revoke a previously written
+> approval or an ACP-side persistent grant; `mode: "deny"` rejects subsequent
+> requests but does not undo earlier grants. Set `permissions: { mode: "deny" }`
+> to opt out.
+
+The automatic policy depends only on current request ownership and the
+validated offered-option IDs/kinds; it does not infer origin from a session ID,
+title, tool kind, or opaque metadata. Malformed, duplicate, stale, foreign, or
+unsupported requests fail closed; if no allowed option is offered, the driver
+selects `reject_once` when available and otherwise returns ACP's `cancelled`
+outcome. The callback form remains available for caller-managed approval of
+one exact offered `allow_once`; callbacks can never select `allow_always` or
+`reject_always`. Invalid callback decisions, exceptions, rejection, and
+overload deny; timeout or a cancelled/changed operation cancels the response.
+Callback work is capped at eight in-flight invocations per SDK, shared across
+its account sessions.
+
+Every positive permission response is guarded at the outbound ACP FIFO write:
+the transport rechecks the monotonic deadline and owning operation/terminal/
+close state, then serializes the selected result immediately before
+`stdin.write()`. A stale approval is replaced by the same request's correlated
+`cancelled` response (or dropped if the transport is no longer writable).
+Calling `stdin.write()` is the byte-commit boundary: later cancellation cannot
+retract those bytes or promise a retroactive denial. Internal filesystem,
+terminal, and unknown client RPC methods remain unsupported and are rejected.
+
+Approving an ACP permission does **not** authorize SDK-side caller-tool
+execution, bypass MCP schema/receipt checks, or establish provenance. In
+callback mode, descriptive fields are bounded; the exact bound MCP
+authorization value and bearer token are removed before truncation, while
+unknown token/URL detection is heuristic. Arbitrary model-supplied text cannot
+be guaranteed fully scrubbed. Handlers must not block the JavaScript thread;
+an elapsed monotonic deadline rejects a late decision, but cannot preempt
+synchronous user code while it is running.
 
 **ACP permission origin is unverified.** ACP v1 defines
 `RequestPermissionRequest.sessionId` and a `ToolCallUpdate`, but it does not
@@ -185,8 +251,73 @@ standardize an MCP-server association on that update; `_meta` is opaque
 extensibility data. The SDK validates any such marker but does not treat it as
 authority and never falls back to a title or kind. An explicitly configured
 callback receives `origin: "unverified"` rather than any claim that a marker
-proves origin. The official executable has not been live-qualified for positive
-permission handling; do not describe live permission handling as verified.
+proves origin. Earlier live requests under the previous default-deny behavior
+were denied; a later live caller-tool request continued under the built-in
+automatic policy (see below). This establishes only that narrow approval path,
+not general permission-origin verification or broad approval behavior.
+
+### Scoped live verification
+
+The following are observations from limited live smoke tests, not general
+support guarantees:
+
+- The official ACP 1.3.0 Linux x64 executable and companion matched their
+  pinned hashes. Two SDK-owned profiles each completed an explicit OAuth
+  login using user-provided Google account selections. The user said the
+  second selection was a different Google account, but the SDK did not
+  independently verify that the underlying identities were distinct; no token
+  inspection was used to establish identity. A low-level live session
+  advertised the exact model values `gemini-3.8-flash-low`,
+  `gemini-3.8-flash-medium`, and `gemini-3.8-flash-high`; this does not
+  guarantee their availability for other accounts or at other times.
+- Through the public SDK, a native non-streaming Messages request returned
+  expected text with a `not-enforced` output-token receipt. A separate session
+  completed a non-streaming first turn and then a streaming second turn using
+  the full history; the second response returned the expected remembered text
+  and its stream-start receipt was also `not-enforced`. The default strict
+  policy rejected a request before dispatch. No test established a hard
+  `max_tokens` limit.
+- A single SDK instance concurrently started one model session for each
+  profile; each session exposed the custom caller tool `get_test_word`. Under
+  the built-in automatic permission policy, each live prompt returned exactly
+  one caller-visible `tool_use`; each operation had an account-bound
+  `not-enforced` receipt. Attempting to use profile B's `tool_use` ID in
+  profile A's continuation was rejected with `InvalidRequestError` before a
+  valid continuation. The correctly matched caller results were distinct
+  random values absent from their prompts; each model returned its own
+  caller-supplied result, ended with `end_turn`, and had a continuation receipt
+  bound to its profile. On profile B, a separate native streamed handoff also
+  returned `tool_use` with a `not-enforced` receipt; non-streaming continuation
+  with a fresh unique caller result completed. These are narrow observations,
+  not proof of general MCP interoperability, identity
+  separation, or approval behavior.
+- Optional Rosetta Chat and Responses adapters each returned expected text in
+  earlier live non-streaming requests with `not-enforced` metadata. Separate
+  streaming checks on profile A/Chat and profile B/Responses returned expected
+  content/completion with `not-enforced` metadata. These checks do not
+  establish broad API compatibility.
+- In a separate native streaming check, early consumer return exposed the
+  initial `not-enforced` receipt; reusing that session then failed with
+  `SessionInterruptedError`. After the SDK and sessions were closed, the
+  subsequent `ps` inspection showed no ACP or localharness processes. This is
+  a bounded host observation, not a general process-cleanup guarantee.
+- Earlier live requests, made under the previous default-deny implementation,
+  produced no `tool_use`; in a separate request, the explicit callback denied
+  `Run list_resources?` and saw `origin: "unverified"` and one-shot options.
+  Those historical denials do not describe the current built-in default.
+
+These observations do not establish that the two profile selections mapped to
+distinct Google identities, OAuth/credential/keychain isolation, cross-process
+isolation, token refresh or logout behavior (neither was run because it would
+alter the current credentials), what permission grants may persist, permission
+outcomes beyond the specific live paths above, official output-token
+enforcement, broad production readiness, or support across the listed
+platforms. The inference and handoff checks used one selected model; other
+advertised model selectors were not separately live-tested. In particular,
+permission origin remains unverified: ACP IDs, titles, tool kinds, and metadata
+are not proof of origin. The built-in automatic policy does not claim otherwise
+and may authorize agent-side effects; use explicit deny mode to disable
+permission approvals.
 
 `createProfileRegistry()` and `createProfileSessionEngine()` remain available
 as lower-level APIs. There is deliberately no default no-op/fake inference
@@ -285,14 +416,18 @@ the original `message_start.message`) to query its receipt. This limitation is
 intentional to avoid guessing operation association from a mutable latest
 snapshot.
 
-`permissions` accepts `{ onRequest, timeoutMs? }`. The timeout defaults to
-10,000 ms and is bounded to 1–60,000 ms. Its callback receives a fresh,
+`permissions` defaults to `{ mode: "auto" }`. Use `{ mode: "deny" }` to opt
+out, or `{ onRequest, timeoutMs? }` for caller-managed one-shot decisions. The
+automatic timeout defaults to 10,000 ms and is bounded to 1–60,000 ms. A
+callback timeout has the same default and bound. Its callback receives a fresh,
 deep-frozen context with account/session/operation/request/tool-call IDs,
 offered ACP option IDs and kinds, bounded sanitized or omitted descriptive
 details with redaction/truncation flags, `origin: "unverified"`, and an
 `AbortSignal` (string IDs are limited to 512 UTF-8 bytes and at most 64 offered
 options are exposed). The callback may deny or select an exact offered
-`allow_once` option; the SDK never selects `allow_always` or `reject_always`.
+`allow_once` option; callback decisions cannot select `allow_always` or
+`reject_always` (automatic mode selects only offered allow options as described
+above).
 Opaque metadata and session identifiers are correlation data, not proof of
 origin. While callback work is pending, its signal is aborted on operation
 cancellation/change, terminal completion, timeout, session close, or profile
@@ -303,7 +438,10 @@ to occupy one of the eight SDK-wide callback slots until it settles.
 Synchronous callback code cannot be preempted, so handlers must be nonblocking.
 Callback exceptions and payloads are not logged.
 Supplying `permissions` together with a custom `sessionDriverFactory` is
-rejected at construction rather than silently bypassing the callback.
+rejected at construction rather than silently bypassing the selected policy.
+When a custom `sessionDriverFactory` is used without `permissions`, the SDK
+does not impose the built-in automatic or deny policy: the custom driver owns
+its permission handling.
 
 An explicit callback can display bounded details to a human and return only an
 exact offered one-shot allow ID after that decision:
@@ -535,8 +673,11 @@ observed Google OAuth HTTPS origin/path, and its redirect must be a numeric
 loopback address. The returned callback must match the exact loopback origin,
 port, path, and per-login state before it is forwarded to that local listener.
 URL, state, callback, child stderr, and credential data are not logged. This
-capture integration is currently supported only on non-Windows hosts and is
-mock-qualified; no live official ACP/browser qualification has been done.
+headless capture integration is currently supported only on non-Windows
+hosts. Explicit SDK-owned OAuth logins succeeded for two profiles in the
+scoped live smoke tests above; the underlying identities were not independently
+verified. This does not establish that every browser/callback route or
+platform is qualified.
 
 `status()` starts no worker, sends no ACP request, opens no browser, and reports
 only the most recent result observed by that particular auth handle. A new
@@ -716,8 +857,19 @@ tool titles/names, inputs/outputs, locations, and metadata are discarded; these
 notifications never invoke caller tools, affect MCP receipts, or enter Messages
 output. Per prompt, activity is limited to 128 events and 1 MiB; total prompt
 event/byte limits still apply. The diagnostic counters saturate at 65,536 and
-report `capped: true` if later events are omitted. Malformed, foreign, terminal-
-late, or unknown notifications fail closed. Malformed/missing results,
+report `capped: true` if later events are omitted. The driver also validates
+and discards ACP v1 `available_commands_update`, `usage_update`, `plan`,
+`plan_update`, `plan_removed`, `current_mode_update`, and `session_info_update`
+as bounded, non-output housekeeping in startup, idle, and prompt phases. These
+updates never become Messages content, caller-tool authority, or per-response
+usage; in particular ACP context occupancy/cost is not represented as token
+usage. Full `config_option_update` values are validated and accepted only
+while the session's selected model remains present and equal to the immutable
+model pin. A model-selector change or omission interrupts the session. ACP
+`user_message_chunk` is rejected rather than silently treated as agent output
+or ignored, because this SDK has no safe mapping for an agent-asserted change
+to caller input. Malformed, foreign-session, oversized, unknown, and
+terminal-late output updates fail closed. Malformed/missing results,
 unsupported output blocks, worker crashes, and aborts commit no transcript and
 interrupt the session.
 
@@ -735,12 +887,17 @@ occupancy observation omits that field rather than presenting a stale value as
 current. The original S5 text-only path does not fabricate thinking blocks or
 signatures; S8 adds only receipt-matched caller `tool_use` content.
 
-S5/S6/S8 and S11.4/S11.5/A2 are deterministic fake-child qualified only. The
+S5/S6/S8 and S11.4/S11.5/A2 have deterministic fake-child coverage. The
 built-in driver implements ACP `session/prompt`, text pumping, authoritative
-MCP call correlation, and same-prompt continuation. Strict admission still
-rejects before inference; compatibility admission is tested with a fake ACP
-process and explicitly does not establish real backend output-token
-enforcement. No live ACP call or official inference behavior is verified.
+MCP call correlation, and same-prompt continuation. In addition, the scoped
+live smoke tests above exercised native non-streaming and streaming text
+inference, caller-tool handoffs across two SDK-owned profiles (including one
+streamed handoff), and streaming and non-streaming adapter inference. Strict
+admission rejected before dispatch; compatibility responses carried
+`not-enforced` receipts. Those observations do not establish the official
+backend's hard output-token enforcement, broad caller-tool interoperability,
+profile or identity isolation, or broad live behavior. The two-profile
+continuation observations below do not establish cross-process isolation.
 
 ## Native Messages streaming and cancellation (S6)
 
@@ -751,9 +908,11 @@ or explicit compatibility output-token policy applies to initial streams and
 tool continuations, with admission before prompt dispatch or result release.
 The built-in driver advertises incremental streaming and only advertises
 `not-enforced` admission when compatibility was explicitly selected. The
-Chat/Responses adapters remain strict until A3 response-scoped disclosure. A
-custom/injected worker declaration is an application contract and is not proof
-that an ACP implementation enforces limits or streams incrementally.
+Chat/Responses adapters preserve the session's strict default and disclose
+unenforced admission only under the explicit compatibility policy (see their
+sections below). A custom/injected worker declaration is an application
+contract and is not proof that an ACP implementation enforces limits or streams
+incrementally.
 
 The streaming worker yields `{ type: "text", text }` events containing actual
 assistant text chunks, then one `{ type: "complete", acknowledgement }` with
@@ -801,6 +960,12 @@ required Anthropic numeric usage fields use the documented zero placeholders
 and diagnostics retain `{ kind: "unknown", ... }`; context occupancy remains
 separate. `message_start` usage is a placeholder because final stream usage is
 not known yet.
+
+The scoped live observations below include native text streaming, one streamed
+caller-tool handoff followed by non-streaming continuation, and an early
+consumer return that interrupted the session after exposing the initial
+`not-enforced` receipt. Those observations do not qualify broader live
+streaming or worker behavior.
 
 ## Session caller-tool MCP transport (S7)
 
@@ -922,9 +1087,11 @@ secret-bearing headers directly to that callback. Drivers must treat those
 headers as secrets and must not log or persist them. A driver without this
 callback must arrange equivalent worker-side MCP configuration itself.
 S11.5 implements these binding and continuation callbacks in the built-in ACP
-driver. The integration is only exercised through a fake child and loopback
-MCP endpoint; the explicit compatibility path does not establish official
-backend `max_tokens` enforcement or live ACP behavior.
+driver. Fixture tests exercise the full integration through a fake child and
+loopback MCP endpoint; the limited live `get_test_word` handoffs across two
+SDK-owned profiles, including one streamed handoff, verify only those narrow
+official paths, not broader tool interoperability or official backend
+`max_tokens` enforcement.
 
 SDK-owned receipts are stored under the account's private profile directory in
 `.sdk-tool-receipts/`, using private files, an exclusive lock, atomic rename,
@@ -1068,10 +1235,13 @@ Messages sequence and EOF are confirmed. Missing/unknown events and malformed
 terminal tool JSON fail the stream; generic worker/SDK errors are not hidden.
 The caller remains responsible for executing function tools and returning
 results. This adapter adds no fetch layer, inference server, credentials, or
-implicit environment lookup. Node 22+ is required. Real ACP inference,
-live-account behavior, and official hard `max_tokens` enforcement remain
-unverified; strict mode fails closed, while the explicit compatibility mode
-does not cap output and may result in additional spend and quota use.
+implicit environment lookup. Node 22+ is required. The scoped observations
+above include a live non-streaming Chat request and a separate streamed Chat
+request on profile A, both with `not-enforced` metadata. This does not qualify
+broader live-account behavior, full Chat compatibility, or official hard
+`max_tokens` enforcement. Strict mode fails closed, while the explicit
+compatibility mode does not cap output and may result in additional spend and
+quota use.
 
 ## Optional Rosetta Responses adapter (S10)
 
@@ -1189,7 +1359,10 @@ Non-stream errors are thrown as surfaced by Messages. Abort and consumer
 `return()`/`throw()` are forwarded even while a `next()` is pending; no
 successful terminal event is fabricated on cancellation. This adapter does not
 add a custom fetch, HTTP server, credential access, or automatic tool execution.
-Node 22+ is required; live ACP inference remains unqualified.
+Node 22+ is required. The scoped observations above include live non-streaming
+Responses and a separate streamed Responses request on profile B, both with
+`not-enforced` metadata. This does not qualify broader compatibility or
+platform support.
 
 ## Scope and lifecycle constraints
 
@@ -1214,8 +1387,8 @@ narrow target is:
 - `max_tokens` is admitted only with an exact per-response grant. Strict mode
   requires the hard-enforcement contract; the approved explicit compatibility
   policy may admit ACP's unenforced bound and reports that outcome without
-  truncating the answer. This repository has no real ACP implementation that
-  proves server-side enforcement.
+  truncating the answer. There is no live evidence that the official ACP
+  backend enforces a hard output-token limit.
 - Streaming is outside S5 and belongs to S6. S7 adds the account/session-bound
   internal MCP registry; S8 adds receipt-backed caller-managed Messages
   handoff and continuation through an injected driver seam.
@@ -1254,21 +1427,29 @@ a fabricated measurement. Because Anthropic requires numeric usage fields, S5
 documents zeros as wire placeholders only. Context occupancy remains a
 separate diagnostic.
 
-The SDK does not implement OAuth exchange or refresh; ACP owns both. The
-login/status/logout lifecycle is mock-qualified only, and its local status is
-intentionally not a remote validity check. The built-in ACP session/prompt
+The SDK does not implement OAuth exchange or refresh; ACP owns both. The broad
+login/status/logout lifecycle has mock coverage, and explicit SDK-owned OAuth
+logins succeeded for two profiles in the scoped live smoke tests above. The
+user reported choosing a different Google account for the second profile, but
+the SDK did not independently verify distinct underlying identities. Live
+refresh and logout were not run because they would alter the current
+credentials; true multi-account identity/isolation and cross-process isolation
+remain unqualified. Local status is intentionally not a remote validity check.
+The built-in ACP session/prompt
 event pump and park/continuation mechanics exist. Strict inference is denied
 until hard per-response `max_tokens` enforcement is established; the explicit
 opt-in compatibility path allows requests without enforcement and does not
-truncate output. Real ACP inference and account behavior remain unqualified,
-and compatibility-mode answers may exceed their requested bounds and increase
-spend or quota use.
+truncate output. Limited live inference is documented above; broader ACP/account
+behavior remains unqualified, and compatibility-mode answers may exceed their
+requested bounds and increase spend or quota use.
 Automatic session resume remains unimplemented. S8 receipts and S11.5
-continuation are mock-tested, not real-worker qualified.
+continuation have fixture coverage; the limited live caller-tool handoffs
+described above do not qualify other tools or broader real-worker behavior.
 Account IDs are
 generated by the S1 registry and missing-account behavior is defined there.
 The S5 usage placeholder policy and request/content allowlist are documented
-above. S8 receipts and S11.5 continuation are mock-tested only; a real ACP
-driver's `max_tokens` enforcement and MCP interoperability remain unverified.
+above. The profile-bound real ACP caller-tool handoffs documented above are
+limited observations; other tool paths and the real ACP driver's `max_tokens`
+enforcement remain unverified.
 Absent a valid strict or explicitly opted-in compatibility admission, the SDK
 rejects the request before dispatch.

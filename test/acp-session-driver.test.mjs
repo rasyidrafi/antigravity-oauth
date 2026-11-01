@@ -32,6 +32,17 @@ const deferred = () => {
 };
 const sleep = (milliseconds = 5) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+function modelConfigOption(id, currentValue, values = ["model-a", "model-b"]) {
+  return {
+    id,
+    type: "select",
+    currentValue,
+    options: values.map((value) => ({ value, name: value })),
+    name: "Model",
+    category: "model",
+  };
+}
+
 async function waitFor(predicate, message = "condition was not reached") {
   const deadline = Date.now() + 1_000;
   while (!await predicate()) {
@@ -182,12 +193,7 @@ function createAgentBehavior({
             sessionId: remoteSessionId,
             update: {
               sessionUpdate: "config_option_update",
-              configOptions: [{
-                id: "model",
-                category: "model",
-                currentValue: "model-a",
-                options: modelValues.map((value) => ({ value, name: value })),
-              }],
+              configOptions: [modelConfigOption("model", "model-a", modelValues)],
             },
           },
         });
@@ -200,12 +206,9 @@ function createAgentBehavior({
         return;
       }
       if (useNotification) {
-        const configOptions = malformedNotification ? undefined : notificationConfigOptions ?? [{
-          id: message.params.configId,
-          category: "model",
-          currentValue: notificationModelValue ?? message.params.value,
-          options: modelValues.map((value) => ({ value, name: value })),
-        }];
+        const configOptions = malformedNotification ? undefined : notificationConfigOptions ?? [
+          modelConfigOption(message.params.configId, notificationModelValue ?? message.params.value, modelValues),
+        ];
         child.send({
           jsonrpc: "2.0",
           method: "session/update",
@@ -368,6 +371,107 @@ function sendPromptText(child, sessionId, text, metadata = {}) {
   });
 }
 
+function sendSessionUpdate(child, sessionId, update) {
+  if (child.ended) return;
+  child.send({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: { sessionId, update },
+  });
+}
+
+function availableCommandsUpdate(secret = "discard-me") {
+  return {
+    sessionUpdate: "available_commands_update",
+    availableCommands: [{
+      name: "safe-command-name",
+      description: secret,
+      input: { hint: `${secret}-hint`, _meta: { private: secret } },
+      _meta: { private: secret },
+    }],
+    _meta: { private: secret },
+  };
+}
+
+function usageUpdate(secret = "discard-me") {
+  return {
+    sessionUpdate: "usage_update",
+    used: 1_536,
+    size: 8_192,
+    cost: { amount: 0.25, currency: "USD", _meta: { private: secret } },
+    _meta: { private: secret },
+  };
+}
+
+function pinnedConfigOptionUpdate(model = "model-a") {
+  const selector = modelConfigOption("model", model);
+  return {
+    sessionUpdate: "config_option_update",
+    configOptions: [
+      {
+        ...selector,
+        description: null,
+        _meta: null,
+        options: selector.options.map((option) => ({ ...option, description: null, _meta: null })),
+      },
+      {
+        id: "reasoning",
+        type: "select",
+        currentValue: "deep",
+        options: [{
+          group: "quality",
+          name: "Quality",
+          options: [{ value: "deep", name: "Deep", description: null, _meta: null }],
+          _meta: null,
+        }],
+        name: "Reasoning",
+        description: null,
+        category: "thought_level",
+        _meta: null,
+      },
+      {
+        id: "enabled",
+        type: "boolean",
+        currentValue: false,
+        name: "Enabled",
+        description: null,
+        category: null,
+        _meta: null,
+      },
+    ],
+    _meta: null,
+  };
+}
+
+function nonOutputSessionUpdates() {
+  return [
+    availableCommandsUpdate("observational-command"),
+    usageUpdate("observational-usage"),
+    { sessionUpdate: "available_commands_update", availableCommands: [{
+      name: "nullable-command-input", description: "bounded command metadata", input: null, _meta: null,
+    }], _meta: null },
+    { sessionUpdate: "usage_update", used: 0, size: 1, cost: null, _meta: null },
+    { sessionUpdate: "usage_update", used: 0, size: 1 },
+    { sessionUpdate: "plan", entries: [{
+      content: "progress only", priority: "medium", status: "in_progress", _meta: null,
+    }], _meta: null },
+    { sessionUpdate: "plan_update", plan: {
+      type: "items", planId: "plan-1", entries: [], _meta: null,
+    }, _meta: null },
+    { sessionUpdate: "plan_update", plan: {
+      type: "file", planId: "plan-1", uri: "file:///workspace/plan.md", _meta: null,
+    } },
+    { sessionUpdate: "plan_update", plan: {
+      type: "markdown", planId: "plan-1", content: "progress only", _meta: null,
+    } },
+    { sessionUpdate: "plan_removed", planId: "plan-1", _meta: null },
+    { sessionUpdate: "current_mode_update", currentModeId: "safe-mode", _meta: null },
+    { sessionUpdate: "session_info_update", title: null, updatedAt: null, _meta: null },
+    { sessionUpdate: "session_info_update" },
+    pinnedConfigOptionUpdate(),
+  ];
+}
+
 const callerTools = [{
   name: "lookup",
   input_schema: {
@@ -429,14 +533,21 @@ const permissionOptions = () => [
   { optionId: "offered-reject-once", name: "Reject once", kind: "reject_once" },
 ];
 
-function permissionParams(sessionId, { server = "antigravity-sdk-session-tools", title = "MCP call", kind = "other", options = permissionOptions(), metadata = true } = {}) {
+function permissionParams(sessionId, {
+  server = "antigravity-sdk-session-tools",
+  tool = "lookup",
+  title = "MCP call",
+  kind = "other",
+  options = permissionOptions(),
+  metadata = true,
+} = {}) {
   return {
     sessionId,
     toolCall: {
       toolCallId: "acp-tool-call-1",
       title,
       kind,
-      ...(metadata ? { _meta: { mcp: { server } } } : {}),
+      ...(metadata ? { _meta: { mcp: { server, tool } } } : {}),
     },
     options,
   };
@@ -611,10 +722,204 @@ test("explicit caller approval selects the exact offered one-shot option without
   });
 });
 
-test("ACP permission rejects foreign, malformed, spoofed-title, filesystem, terminal, and unknown requests", async () => {
+test("the default automatic policy repeatedly prefers allow_always and falls back only to offered one-shot allows", async () => {
+  await withTempDirectory(async (root) => {
+    const state = {};
+    const onlyAlways = [
+      { optionId: "auto-once-first", name: "Allow once", kind: "allow_once" },
+      { optionId: "auto-always-first", name: "Always allow", kind: "allow_always" },
+      { optionId: "auto-always-second", name: "Also always allow", kind: "allow_always" },
+      { optionId: "auto-reject", name: "Reject once", kind: "reject_once" },
+    ];
+    const fallbackOnce = [
+      { optionId: "fallback-once-first", name: "Allow once", kind: "allow_once" },
+      { optionId: "fallback-once-second", name: "Allow once", kind: "allow_once" },
+      { optionId: "fallback-reject", name: "Reject once", kind: "reject_once" },
+    ];
+    const noAllow = [
+      { optionId: "no-allow-reject", name: "Reject once", kind: "reject_once" },
+      { optionId: "never-reject-always", name: "Always reject", kind: "reject_always" },
+    ];
+    const rejectAlwaysOnly = [
+      { optionId: "reject-always-only", name: "Always reject", kind: "reject_always" },
+    ];
+    const duplicateOptions = [
+      { optionId: "duplicate-option", name: "Allow always", kind: "allow_always" },
+      { optionId: "duplicate-option", name: "Reject once", kind: "reject_once" },
+    ];
+    const cases = [
+      ["auto-always-one", onlyAlways, "auto-always-first"],
+      ["auto-always-repeat", onlyAlways, "auto-always-first"],
+      ["auto-once-fallback", fallbackOnce, "fallback-once-first"],
+      ["auto-without-mcp-marker", onlyAlways, "auto-always-first", false],
+      ["auto-no-allow", noAllow, "no-allow-reject"],
+      ["auto-reject-always-only", rejectAlwaysOnly, undefined],
+      ["auto-malformed-duplicate", duplicateOptions, undefined],
+    ];
+    const fixture = createPromptSdk(root, {
+      // Omitting permissions exercises the public SDK's built-in auto default.
+      onPrompt(message, child) {
+        state.agentTask = (async () => {
+          sendPermissionRequest(child, "auto-foreign-session", permissionParams("foreign-remote-session"));
+          state.responses = {
+            "auto-foreign-session": await waitForAcpResponse(child, "auto-foreign-session"),
+          };
+          for (const [id, options, _expectedOptionId, metadata = true] of cases) {
+            sendPermissionRequest(child, id, permissionParams(message.params.sessionId, { options, metadata }));
+            state.responses ??= {};
+            state.responses[id] = await waitForAcpResponse(child, id);
+          }
+          sendPromptText(child, message.params.sessionId, "automatic decision complete");
+          child.reply(message.id, { stopReason: "end_turn" });
+          sendPermissionRequest(child, "auto-after-terminal", permissionParams(message.params.sessionId));
+          state.responses["auto-after-terminal"] = await waitForAcpResponse(child, "auto-after-terminal");
+        })().catch((error) => {
+          state.agentError = error;
+          child.exit(1);
+        });
+      },
+    });
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({ model: "model-a", cwd: "/workspace/automatic-permissions" });
+    try {
+      const response = await session.messages.create({
+        max_tokens: 10,
+        messages: [{ role: "user", content: "exercise automatic permission policy" }],
+      });
+      await state.agentTask;
+      assert.equal(state.agentError, undefined);
+      for (const [id, _options, expectedOptionId] of cases) {
+        assert.deepEqual(state.responses[id].result.outcome, expectedOptionId
+          ? { outcome: "selected", optionId: expectedOptionId }
+          : { outcome: "cancelled" }, id);
+      }
+      assert.deepEqual(state.responses["auto-foreign-session"].result.outcome, {
+        outcome: "selected", optionId: "offered-reject-once",
+      });
+      assert.deepEqual(state.responses["auto-after-terminal"].result.outcome, {
+        outcome: "selected", optionId: "offered-reject-once",
+      });
+      assert.deepEqual(response.content, [{ type: "text", text: "automatic decision complete" }]);
+      assert.equal(session.state, "idle");
+    } finally {
+      await session.close();
+      await fixture.sdk.close();
+    }
+  });
+});
+
+test("MCP permission metadata is bounded opaque syntax and never creates caller-tool authority", async (t) => {
+  const cases = [
+    ["official full shape at the identifier byte limit", { server: "s".repeat(512), tool: "t".repeat(512) }, true],
+    ["previous server-only shape remains accepted", { server: "legacy-server-only" }, true],
+    ["forged opaque identifiers and spoofed title remain non-authoritative", {
+      server: "not-the-bound-server", tool: "not-the-caller-tool",
+    }, true, "Run trusted MCP lookup"],
+    ["oversized server identifier", { server: "s".repeat(513), tool: "lookup" }, false],
+    ["oversized tool identifier", { server: "server", tool: "t".repeat(513) }, false],
+    ["empty MCP identifier", { server: "server", tool: "" }, false],
+    ["missing server identifier", { tool: "lookup" }, false],
+    ["unexpected MCP metadata field", { server: "server", tool: "lookup", verified: true }, false],
+    ["non-string MCP tool identifier", { server: "server", tool: 7 }, false],
+  ];
   await withTempDirectory(async (root) => {
     const state = {};
     const fixture = createPromptSdk(root, {
+      onPrompt(message, child) {
+        state.agentTask = (async () => {
+          state.responses = {};
+          for (const [name, mcp, _accepted, title] of cases) {
+            const params = permissionParams(message.params.sessionId, {
+              title: title ?? "MCP call",
+              options: [
+                { optionId: "opaque-allow-always", name: "Always allow", kind: "allow_always" },
+                { optionId: "opaque-allow-once", name: "Allow once", kind: "allow_once" },
+              ],
+            });
+            params.toolCall._meta = { mcp };
+            sendPermissionRequest(child, name, params);
+            state.responses[name] = await waitForAcpResponse(child, name);
+          }
+          sendPromptText(child, message.params.sessionId, "metadata did not call a tool");
+          child.reply(message.id, { stopReason: "end_turn" });
+        })().catch((error) => {
+          state.agentError = error;
+          child.exit(1);
+        });
+      },
+    });
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({
+      model: "model-a", cwd: "/workspace/opaque-permission-metadata", tools: callerTools,
+    });
+    try {
+      await session.tools.createMcpServer();
+      const response = await session.messages.create({
+        max_tokens: 10,
+        messages: [{ role: "user", content: "inspect opaque permission metadata" }],
+      });
+      await state.agentTask;
+      assert.equal(state.agentError, undefined);
+      assert.deepEqual(response.content, [{ type: "text", text: "metadata did not call a tool" }]);
+      for (const [name, _mcp, accepted] of cases) {
+        assert.deepEqual(state.responses[name].result.outcome, accepted
+          ? { outcome: "selected", optionId: "opaque-allow-always" }
+          : { outcome: "cancelled" }, name);
+      }
+      assert.deepEqual(await session.diagnostics.toolHandoffs(), [],
+        "permission metadata, including a forged server/tool/title claim, cannot mint an SDK caller-tool receipt");
+      assert.equal(fixture.children[0].writes.some(({ method }) => method === "session/prompt"), true);
+      assert.equal(session.state, "idle");
+    } finally {
+      await session.close();
+      await fixture.sdk.close();
+    }
+  });
+});
+
+test("explicit deny policy rejects an offered one-shot option without invoking a caller callback", async () => {
+  await withTempDirectory(async (root) => {
+    const state = {};
+    const fixture = createPromptSdk(root, {
+      permissions: { mode: "deny" },
+      onPrompt(message, child) {
+        state.agentTask = (async () => {
+          sendPermissionRequest(child, "explicit-deny", permissionParams(message.params.sessionId));
+          state.permission = await waitForAcpResponse(child, "explicit-deny");
+          sendPromptText(child, message.params.sessionId, "explicit denial complete");
+          child.reply(message.id, { stopReason: "end_turn" });
+        })().catch((error) => {
+          state.agentError = error;
+          child.exit(1);
+        });
+      },
+    });
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({ model: "model-a", cwd: "/workspace/explicit-permission-denial" });
+    try {
+      const response = await session.messages.create({
+        max_tokens: 10,
+        messages: [{ role: "user", content: "deny permission explicitly" }],
+      });
+      await state.agentTask;
+      assert.equal(state.agentError, undefined);
+      assert.deepEqual(state.permission.result.outcome, {
+        outcome: "selected",
+        optionId: "offered-reject-once",
+      });
+      assert.deepEqual(response.content, [{ type: "text", text: "explicit denial complete" }]);
+    } finally {
+      await session.close();
+      await fixture.sdk.close();
+    }
+  });
+});
+
+test("explicit deny policy rejects foreign, malformed, spoofed-title, filesystem, terminal, and unknown requests", async () => {
+  await withTempDirectory(async (root) => {
+    const state = {};
+    const fixture = createPromptSdk(root, {
+      permissions: { mode: "deny" },
       onPrompt(message, child) {
         state.agentTask = (async () => {
           const cases = [
@@ -682,6 +987,8 @@ test("ACP permission rejects foreign, malformed, spoofed-title, filesystem, term
         assert.equal(state.denials[id].error.code, -32601, id);
       }
       assert.equal(fixture.requests.filter(({ method }) => method === "session/cancel").length, 0);
+      assert.deepEqual(await session.diagnostics.toolHandoffs(), [],
+        "spoofed tool titles/metadata and permission outcomes cannot create a caller handoff without MCP tools/call");
       assert.equal(session.state, "idle");
     } finally {
       await session.close();
@@ -843,6 +1150,9 @@ test("permission callback receives bounded redacted immutable context and no raw
       assert.equal(Object.hasOwn(context, "rawInput"), false);
       assert.equal(Object.hasOwn(context, "rawOutput"), false);
       assert.equal(Object.hasOwn(context, "_meta"), false);
+      assert.equal(JSON.stringify(context).includes("opaque-unverified-marker"), false);
+      assert.equal(JSON.stringify(context).includes('"tool":"lookup"'), false,
+        "neither MCP metadata identifier is projected to the caller callback");
       assert.equal(JSON.stringify(context).includes("private.example"), false);
       assert.equal(JSON.stringify(context).includes("do-not-disclose"), false);
       assert.equal(state.contexts[1].details.title, "[redacted]");
@@ -1178,6 +1488,92 @@ test("queued permission approvals are revalidated immediately before the ACP std
   });
 });
 
+test("automatic allow_always responses are guarded through queued cancellation, deadline, terminal, and close transitions", async (t) => {
+  const runCase = async (root, kind) => {
+    const controller = new AbortController();
+    const timeoutMs = kind === "deadline" ? 25 : 2_000;
+    const state = {};
+    const id = `auto-queued-${kind}`;
+    const fixture = createPromptSdk(root, {
+      permissions: { mode: "auto", timeoutMs },
+      holdWrite: (message) => message.method === "session/prompt",
+      onPrompt(message, child) {
+        state.prompt = message;
+        sendPermissionRequest(child, id, permissionParams(message.params.sessionId));
+        state.agentTask = waitForAcpResponse(child, id).then((response) => {
+          state.permission = response;
+          if (kind === "deadline") {
+            sendPromptText(child, message.params.sessionId, `auto ${kind} handled`);
+            child.reply(message.id, { stopReason: "end_turn" });
+          }
+        });
+      },
+    });
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({ model: "model-a", cwd: `/workspace/${id}` });
+    try {
+      const operation = session.messages.create({
+        max_tokens: 10,
+        messages: [{ role: "user", content: `queue automatic permission ${kind}` }],
+      }, { signal: controller.signal });
+      void operation.catch(() => undefined);
+      await waitFor(() => state.prompt);
+      await new Promise((resolve) => setImmediate(resolve));
+      const child = fixture.children[0];
+      assert.equal(child.blockedWrites.some(({ message }) => message.method === "session/prompt"), true);
+      assert.equal(child.writes.some((message) => message.id === id && message.result), false,
+        "the positive auto result must remain queued behind the blocked prompt write");
+
+      if (kind === "cancel") {
+        controller.abort();
+        child.releaseWrite("session/prompt");
+        await assert.rejects(operation, RequestAbortedError);
+      } else if (kind === "deadline") {
+        await sleep(timeoutMs + 15);
+        child.releaseWrite("session/prompt");
+        await waitFor(() => state.permission);
+        assert.deepEqual(state.permission.result.outcome, { outcome: "cancelled" });
+        await operation;
+      } else if (kind === "terminal") {
+        sendPromptText(child, state.prompt.params.sessionId, "terminal before automatic permission write");
+        child.reply(state.prompt.id, { stopReason: "end_turn" });
+        await operation;
+        child.releaseWrite("session/prompt");
+      } else {
+        const closing = session.close();
+        await waitFor(() => session.state === "closed");
+        if (child.blockedWrites.some(({ message }) => message.method === "session/prompt")) {
+          child.releaseWrite("session/prompt");
+        }
+        await closing;
+        await assert.rejects(operation, RequestAbortedError);
+      }
+
+      if (kind !== "close") {
+        await waitFor(() => state.permission);
+        assert.deepEqual(state.permission.result.outcome, { outcome: "cancelled" }, kind);
+      }
+      assert.equal(child.writes.some((message) => message.id === id &&
+        message.result?.outcome?.outcome === "selected" &&
+        message.result?.outcome?.optionId === "offered-allow-always"), false,
+      `${kind} must never write the stale automatic allow`);
+      assert.equal(child.writes.filter((message) => message.id === id).length <= 1, true,
+        "an inbound permission request receives at most one response");
+    } finally {
+      controller.abort();
+      if (fixture.children[0]?.blockedWrites.some(({ message }) => message.method === "session/prompt")) {
+        fixture.children[0].releaseWrite("session/prompt");
+      }
+      await session.close();
+      await fixture.sdk.close();
+    }
+  };
+
+  for (const kind of ["cancel", "deadline", "terminal", "close"]) {
+    await t.test(kind, async () => withTempDirectory((root) => runCase(root, kind)));
+  }
+});
+
 test("queued permission responses retain independent IDs and FIFO ordering with strict unknown-method errors", async () => {
   await withTempDirectory(async (root) => {
     const contexts = [];
@@ -1302,6 +1698,75 @@ test("a caller-tool continuation transition revokes an already-approved queued p
       assert.equal(state.agentError, undefined);
       assert.deepEqual(result.content, [{ type: "text", text: "continued after permission cancellation" }]);
       assert.deepEqual(state.callerResult.body.result.content, [{ type: "text", text: "continued result" }]);
+    } finally {
+      continueAgent.resolve();
+      if (fixture.children[0]?.blockedWrites.some(({ message }) => message.method === "session/prompt")) {
+        fixture.children[0].releaseWrite("session/prompt");
+      }
+      await session.close();
+      await fixture.sdk.close();
+    }
+  });
+});
+
+test("automatic allow_always queued for one tool operation is cancelled when continuation takes ownership", async () => {
+  await withTempDirectory(async (root) => {
+    const callerResultsReady = deferred();
+    const continueAgent = deferred();
+    const state = {};
+    const fixture = createPromptSdk(root, {
+      // Omission deliberately exercises auto as the built-in default.
+      holdWrite: (message) => message.method === "session/prompt",
+      onPrompt(message, child) {
+        state.agentTask = (async () => {
+          const mcp = await initializeFakeMcp(mcpServerFromChild(child));
+          sendPermissionRequest(child, "automatic-continuation-queued", permissionParams(message.params.sessionId));
+          const callerWaiter = mcp.call("automatic-continuation-owned", 874);
+          state.callerResult = await callerWaiter;
+          callerResultsReady.resolve();
+          await continueAgent.promise;
+          sendPromptText(child, message.params.sessionId, "continued after automatic permission cancellation");
+          child.reply(message.id, { stopReason: "end_turn" });
+        })().catch((error) => {
+          state.agentError = error;
+          child.exit(1);
+        });
+      },
+    });
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({
+      model: "model-a", cwd: "/workspace/automatic-permission-continuation", tools: callerTools,
+    });
+    try {
+      await session.tools.createMcpServer();
+      const user = { role: "user", content: "park a caller tool and queue an automatic approval" };
+      const initial = await session.messages.create({ max_tokens: 29, messages: [user] });
+      const toolUse = initial.content.find((block) => block.type === "tool_use");
+      assert.ok(toolUse);
+      const child = fixture.children[0];
+      await waitFor(() => child.blockedWrites.some(({ message }) => message.method === "session/prompt"));
+      assert.equal(child.writes.some((message) => message.id === "automatic-continuation-queued" && message.result), false);
+
+      const continuation = session.messages.create({
+        max_tokens: 31,
+        messages: [user, { role: "assistant", content: initial.content }, {
+          role: "user", content: [toolResult(toolUse, "continued result")],
+        }],
+      });
+      await callerResultsReady.promise;
+      await new Promise((resolve) => setImmediate(resolve));
+      child.releaseWrite("session/prompt");
+      const permission = await waitForAcpResponse(child, "automatic-continuation-queued");
+      assert.deepEqual(permission.result.outcome, { outcome: "cancelled" });
+      continueAgent.resolve();
+      const result = await continuation;
+      await state.agentTask;
+      assert.equal(state.agentError, undefined);
+      assert.deepEqual(result.content, [{ type: "text", text: "continued after automatic permission cancellation" }]);
+      assert.deepEqual(state.callerResult.body.result.content, [{ type: "text", text: "continued result" }]);
+      assert.equal(child.writes.some((message) => message.id === "automatic-continuation-queued" &&
+        message.result?.outcome?.outcome === "selected" &&
+        message.result?.outcome?.optionId === "offered-allow-always"), false);
     } finally {
       continueAgent.resolve();
       if (fixture.children[0]?.blockedWrites.some(({ message }) => message.method === "session/prompt")) {
@@ -2053,8 +2518,8 @@ test("configOptions notifications verify eager and MCP-lazy startup without acce
       behavior: {
         useNotification: true,
         notificationConfigOptions: [
-          { id: "model", category: "model", currentValue: "model-b" },
-          { id: "model-alias", category: "model", currentValue: "model-b" },
+          modelConfigOption("model", "model-b"),
+          modelConfigOption("model-alias", "model-b"),
         ],
       },
       expected: ProtocolFailureError,
@@ -3862,6 +4327,334 @@ test("a post-completion ACP update prevents Session Messages stream commit", asy
       await fixture.sdk.close();
     }
   });
+});
+
+test("ACP v1 available commands and context usage are validated then discarded across owned lifecycle phases", async () => {
+  await withTempDirectory(async (root) => {
+    let promptIndex = 0;
+    const fixture = createPromptSdk(root, {
+      onSessionNew(message, child, index, startup) {
+        const remoteSessionId = `remote-prompt-${index}-1`;
+        // Both notifications precede session/new's response and must be
+        // reconciled against its returned ID rather than buffered as output.
+        sendSessionUpdate(child, remoteSessionId, availableCommandsUpdate("startup-command-secret"));
+        sendSessionUpdate(child, remoteSessionId, usageUpdate("startup-usage-secret"));
+        startup(message, child);
+        // These follow the response on the wire and can be handled as startup
+        // housekeeping or idle updates depending on promise scheduling.
+        sendSessionUpdate(child, remoteSessionId, availableCommandsUpdate("post-new-command-secret"));
+        sendSessionUpdate(child, remoteSessionId, usageUpdate("post-new-usage-secret"));
+      },
+      onPrompt(message, child) {
+        const sessionId = message.params.sessionId;
+        const index = promptIndex++;
+        sendSessionUpdate(child, sessionId, availableCommandsUpdate(`prompt-command-secret-${index}`));
+        sendSessionUpdate(child, sessionId, usageUpdate(`prompt-usage-secret-${index}`));
+        sendPromptText(child, sessionId, `answer-${index}`);
+        child.reply(message.id, { stopReason: "end_turn" });
+        // Allowed terminal housekeeping; a late text chunk remains forbidden.
+        sendSessionUpdate(child, sessionId, usageUpdate(`terminal-usage-secret-${index}`));
+      },
+    });
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({ model: "model-a", cwd: "/workspace/discarded-updates" });
+    try {
+      assert.equal(session.capabilities.maxTokens, "enforced");
+      const nextNotification = fixture.drivers[0].notifications()[Symbol.asyncIterator]().next();
+      assert.equal(await Promise.race([nextNotification.then(() => true), sleep(20).then(() => false)]), false,
+        "discarded command and context-usage updates never enter the session notification feed");
+      const child = fixture.children[0];
+      sendSessionUpdate(child, "remote-prompt-0-1", availableCommandsUpdate("idle-command-secret"));
+      sendSessionUpdate(child, "remote-prompt-0-1", usageUpdate("idle-usage-secret"));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const first = await session.messages.create({ max_tokens: 11, messages: [{ role: "user", content: "first" }] });
+      assert.deepEqual(first.content, [{ type: "text", text: "answer-0" }]);
+      assert.equal(first.usage.input_tokens, 0);
+      assert.equal(first.usage.output_tokens, 0);
+      assert.equal(messageMaxTokensEnforcement(first).outcome, "enforced");
+
+      const stream = await session.messages.create({
+        max_tokens: 12,
+        messages: [
+          { role: "user", content: "first" },
+          { role: "assistant", content: first.content },
+          { role: "user", content: "second" },
+        ],
+        stream: true,
+      });
+      const events = [];
+      for await (const event of stream) events.push(event);
+      assert.equal(events.filter((event) => event.type === "content_block_delta" &&
+        event.delta.type === "text_delta").map((event) => event.delta.text).join(""), "answer-1");
+      const terminal = events.find((event) => event.type === "message_delta");
+      assert.equal(terminal.usage.input_tokens, 0);
+      assert.equal(terminal.usage.output_tokens, 0);
+      assert.equal(events.at(-1).type, "message_stop");
+      assert.equal(messageMaxTokensEnforcement(events.find((event) => event.type === "message_start").message).outcome,
+        "enforced");
+      const snapshot = await session.diagnostics.snapshot();
+      assert.equal(snapshot.usage.kind, "unknown");
+      assert.equal(snapshot.maxTokensEnforcement.policy, "strict");
+      assert.equal(JSON.stringify({ first, events, snapshot }).includes("secret"), false);
+      assert.equal(session.state, "idle");
+    } finally {
+      await session.close();
+      await fixture.sdk.close();
+    }
+  });
+});
+
+test("pre-session ACP command/usage updates reconcile exact ownership and reject malformed or oversized data", async (t) => {
+  const scenarios = [
+    ["foreign startup session ID", (child, sessionId) =>
+      sendSessionUpdate(child, `${sessionId}-foreign`, availableCommandsUpdate("foreign"))],
+    ["oversized command description", (child, sessionId) => sendSessionUpdate(child, sessionId, {
+      sessionUpdate: "available_commands_update",
+      availableCommands: [{ name: "too-large", description: "x".repeat(16 * 1024 + 1) }],
+    })],
+    ["malformed usage update", (child, sessionId) =>
+      sendSessionUpdate(child, sessionId, { sessionUpdate: "usage_update", used: 1 })],
+    ["unknown update field", (child, sessionId) => sendSessionUpdate(child, sessionId, {
+      ...usageUpdate(), unexpected: "must-fail-closed",
+    })],
+    ["bounded startup notification count", (child, sessionId) => {
+      for (let index = 0; index < 257 && !child.ended; index += 1) {
+        sendSessionUpdate(child, sessionId, { sessionUpdate: "usage_update", used: index, size: 8_192 });
+      }
+    }],
+    ["bounded startup notification bytes", (child, sessionId) => {
+      const opaque = "x".repeat(250 * 1024);
+      for (let index = 0; index < 17 && !child.ended; index += 1) {
+        sendSessionUpdate(child, sessionId, {
+          sessionUpdate: "usage_update",
+          used: index,
+          size: 8_192,
+          _meta: { opaque },
+        });
+      }
+    }],
+  ];
+  for (const [name, emit] of scenarios) {
+    await t.test(name, async () => withTempDirectory(async (root) => {
+      const fixture = createPromptSdk(root, {
+        onSessionNew(message, child, index, startup) {
+          const sessionId = `remote-prompt-${index}-1`;
+          emit(child, sessionId);
+          if (!child.ended) startup(message, child);
+        },
+      });
+      const account = await fixture.sdk.accounts.create();
+      await assert.rejects(
+        account.sessions.create({ model: "model-a", cwd: `/workspace/${name.replaceAll(" ", "-")}` }),
+        ProtocolFailureError,
+      );
+      assert.equal(fixture.children[0].ended, true);
+      await fixture.sdk.close();
+    }));
+  }
+});
+
+test("idle ACP command/usage updates have a cumulative byte bound", async () => {
+  await withTempDirectory(async (root) => {
+    const fixture = createPromptSdk(root);
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({ model: "model-a", cwd: "/workspace/idle-bound" });
+    try {
+      const largeMeta = "x".repeat(255 * 1024);
+      for (let index = 0; index < 33; index += 1) {
+        sendSessionUpdate(fixture.children[0], "remote-prompt-0-1", {
+          sessionUpdate: "usage_update",
+          used: index,
+          size: 8_192,
+          _meta: { opaque: largeMeta },
+        });
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      await assert.rejects(
+        session.messages.create({ max_tokens: 10, messages: [{ role: "user", content: "after idle flood" }] }),
+        ProtocolFailureError,
+      );
+      assert.equal(session.state, "interrupted");
+      assert.deepEqual(session.snapshot().transcript, []);
+    } finally {
+      await session.close();
+      await fixture.sdk.close();
+    }
+  });
+});
+
+test("ACP v1 progress, mode, session-info, and config updates are bounded non-output observations across phases", async () => {
+  await withTempDirectory(async (root) => {
+    const updates = nonOutputSessionUpdates();
+    let promptIndex = 0;
+    const fixture = createPromptSdk(root, {
+      onSessionNew(message, child, index, startup) {
+        const sessionId = `remote-prompt-${index}-1`;
+        for (const update of updates) sendSessionUpdate(child, sessionId, update);
+        startup(message, child);
+        for (const update of updates) sendSessionUpdate(child, sessionId, update);
+      },
+      onPrompt(message, child) {
+        const sessionId = message.params.sessionId;
+        const index = promptIndex++;
+        for (const update of updates) sendSessionUpdate(child, sessionId, update);
+        sendPromptText(child, sessionId, `answer-${index}`);
+        child.reply(message.id, { stopReason: "end_turn" });
+        // Non-output session housekeeping can follow the terminal reply; text cannot.
+        sendSessionUpdate(child, sessionId, {
+          sessionUpdate: "session_info_update", title: null, updatedAt: null,
+        });
+        sendSessionUpdate(child, sessionId, { sessionUpdate: "plan_removed", planId: "plan-1" });
+      },
+    });
+    const account = await fixture.sdk.accounts.create();
+    const session = await account.sessions.create({ model: "model-a", cwd: "/workspace/non-output" });
+    try {
+      for (const update of updates) sendSessionUpdate(fixture.children[0], "remote-prompt-0-1", update);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const first = await session.messages.create({ max_tokens: 10, messages: [{ role: "user", content: "first" }] });
+      assert.deepEqual(first.content, [{ type: "text", text: "answer-0" }]);
+      const streamed = await session.messages.create({
+        max_tokens: 10,
+        messages: [
+          { role: "user", content: "first" },
+          { role: "assistant", content: first.content },
+          { role: "user", content: "second" },
+        ],
+        stream: true,
+      });
+      const events = [];
+      for await (const event of streamed) events.push(event);
+      assert.equal(events.filter((event) => event.type === "content_block_delta" &&
+        event.delta.type === "text_delta").map((event) => event.delta.text).join(""), "answer-1");
+      assert.equal(JSON.stringify({ first, events }).includes("observational-"), false);
+      assert.equal(session.state, "idle");
+      assert.equal((await session.diagnostics.snapshot()).usage.kind, "unknown",
+        "usage_update context occupancy is not per-response token accounting");
+    } finally {
+      await session.close();
+      await fixture.sdk.close();
+    }
+  });
+});
+
+test("ACP session-update schema gaps fail closed for wrong sessions, invalid shapes, limits, and unsupported user echoes", async (t) => {
+  const oversizedPlanEntries = Array.from({ length: 257 }, () => ({
+    content: "bounded plan entry", priority: "low", status: "pending",
+  }));
+  const scenarios = [
+    {
+      name: "unknown plan field during startup",
+      phase: "startup",
+      update: { sessionUpdate: "plan", entries: [], unrecognized: true },
+    },
+    {
+      name: "invalid plan entry enum during startup",
+      phase: "startup",
+      update: { sessionUpdate: "plan", entries: [{ content: "x", priority: "urgent", status: "pending" }] },
+    },
+    {
+      name: "oversized plan entry count while idle",
+      phase: "idle",
+      update: { sessionUpdate: "plan", entries: oversizedPlanEntries },
+    },
+    {
+      name: "oversized markdown plan while prompting",
+      phase: "prompt",
+      update: { sessionUpdate: "plan_update", plan: { type: "markdown", planId: "p", content: "x".repeat(16 * 1024 + 1) } },
+    },
+    {
+      name: "foreign session mode notification while idle",
+      phase: "idle",
+      foreign: true,
+      update: { sessionUpdate: "current_mode_update", currentModeId: "safe-mode" },
+    },
+    {
+      name: "malformed session info during prompting",
+      phase: "prompt",
+      update: { sessionUpdate: "session_info_update", title: 7 },
+    },
+    {
+      name: "missing required config option name while idle",
+      phase: "idle",
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: [{ id: "model", type: "select", currentValue: "model-a", options: [], category: "model" }],
+      },
+    },
+    {
+      name: "omitted pinned model selector while idle",
+      phase: "idle",
+      update: { sessionUpdate: "config_option_update", configOptions: [] },
+    },
+    {
+      name: "changed pinned model during prompt",
+      phase: "prompt",
+      update: pinnedConfigOptionUpdate("model-b"),
+    },
+    {
+      name: "valid user-message chunk is not silently discarded",
+      phase: "prompt",
+      update: {
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: "agent asserted a changed user message" },
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => withTempDirectory(async (root) => {
+      const emit = (child, sessionId) => sendSessionUpdate(
+        child,
+        scenario.foreign ? `${sessionId}-foreign` : sessionId,
+        scenario.update,
+      );
+      const fixture = createPromptSdk(root, {
+        ...(scenario.phase === "startup" ? {
+          onSessionNew(message, child, index, startup) {
+            emit(child, `remote-prompt-${index}-1`);
+            if (!child.ended) startup(message, child);
+          },
+        } : {}),
+        ...(scenario.phase === "prompt" ? {
+          onPrompt(message, child) {
+            emit(child, message.params.sessionId);
+            if (!child.ended) {
+              sendPromptText(child, message.params.sessionId, "must not commit");
+              child.reply(message.id, { stopReason: "end_turn" });
+            }
+          },
+        } : {}),
+      });
+      const account = await fixture.sdk.accounts.create();
+      if (scenario.phase === "startup") {
+        await assert.rejects(
+          account.sessions.create({ model: "model-a", cwd: "/workspace/startup-update-error" }),
+          ProtocolFailureError,
+        );
+        assert.equal(fixture.children[0].ended, true);
+      } else {
+        const session = await account.sessions.create({ model: "model-a", cwd: "/workspace/update-error" });
+        try {
+          if (scenario.phase === "idle") {
+            emit(fixture.children[0], "remote-prompt-0-1");
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+          await assert.rejects(
+            session.messages.create({ max_tokens: 10, messages: [{ role: "user", content: scenario.name }] }),
+            ProtocolFailureError,
+          );
+          assert.equal(session.state, "interrupted");
+          assert.deepEqual(session.snapshot().transcript, []);
+        } finally {
+          await session.close();
+        }
+      }
+      await fixture.sdk.close();
+    }));
+  }
 });
 
 test("an empty ACP text delta remains a real empty Messages text block in both modes", async () => {

@@ -121,6 +121,30 @@ function sendActivity(child, sessionId, update, updateSessionId = sessionId) {
   });
 }
 
+function sendDiscardedSessionUpdates(child, sessionId, label, { commands = true, usage = true } = {}) {
+  if (commands) {
+    sendActivity(child, sessionId, {
+      sessionUpdate: "available_commands_update",
+      availableCommands: [{
+        name: `/private-${label}`,
+        description: `command-description-secret-${label}`,
+        input: { hint: `command-hint-secret-${label}`, _meta: { private: label } },
+        _meta: { private: `command-meta-secret-${label}` },
+      }],
+      _meta: { private: `command-update-secret-${label}` },
+    });
+  }
+  if (usage) {
+    sendActivity(child, sessionId, {
+      sessionUpdate: "usage_update",
+      used: 1536,
+      size: 8192,
+      cost: { amount: 0.25, currency: "USD", _meta: { private: label } },
+      _meta: { private: `context-usage-secret-${label}` },
+    });
+  }
+}
+
 function thoughtUpdates(prefix) {
   return [
     {
@@ -193,7 +217,7 @@ const permissionOptions = [
   { optionId: "allow-always", name: "Always allow", kind: "allow_always" },
 ];
 
-function permissionParams(sessionId, title) {
+function permissionParams(sessionId, title, options = permissionOptions) {
   return {
     sessionId,
     toolCall: {
@@ -202,9 +226,11 @@ function permissionParams(sessionId, title) {
       name: "lookup",
       kind: "execute",
       rawInput: { private: "must-not-reach-the-callback" },
-      _meta: { mcp: { server: "opaque-unverified-marker" } },
+      // Exact bounded shape observed on the pinned official ACP 1.3.0
+      // MCP permission request. Both identifiers remain untrusted metadata.
+      _meta: { mcp: { server: "opaque-unverified-marker", tool: "lookup" } },
     },
-    options: permissionOptions,
+    options,
   };
 }
 
@@ -256,7 +282,7 @@ function mcpServerFromChild(child) {
   return server;
 }
 
-function driverBehavior(agentErrors, activityScenarios) {
+function driverBehavior(agentErrors, activityScenarios, permissionScenarios) {
   return (message, child) => {
     const index = child.index;
     if (message.method === "initialize") {
@@ -272,7 +298,7 @@ function driverBehavior(agentErrors, activityScenarios) {
     }
     if (message.method === "session/new") {
       const remoteSessionId = `remote-session-${index}`;
-      child.reply(message.id, {
+      const result = {
         sessionId: remoteSessionId,
         configOptions: [{
           id: "model",
@@ -281,7 +307,12 @@ function driverBehavior(agentErrors, activityScenarios) {
           options: ["model-0", "model-1", "model-2", "model-3", "strict-model"]
             .map((value) => ({ value, name: value })),
         }],
-      });
+      };
+      // Exercise both wire orders around session/new: the first worker sends
+      // before the response, while the others send immediately after it.
+      if (index === 0) sendDiscardedSessionUpdates(child, remoteSessionId, `startup-${index}`);
+      child.reply(message.id, result);
+      if (index !== 0) sendDiscardedSessionUpdates(child, remoteSessionId, `startup-${index}`);
       return;
     }
     if (message.method === "session/set_config_option") {
@@ -323,18 +354,66 @@ function driverBehavior(agentErrors, activityScenarios) {
                 content: { type: "text", text: largeThought },
               });
             }
+          } else if (activityScenario === "foreign-command") {
+            sendActivity(child, sessionId, {
+              sessionUpdate: "available_commands_update",
+              availableCommands: [],
+            }, `${sessionId}-foreign`);
+          } else if (activityScenario === "malformed-command") {
+            sendActivity(child, sessionId, {
+              sessionUpdate: "available_commands_update",
+              availableCommands: [{ name: "missing-description" }],
+            });
+          } else if (activityScenario === "oversized-command") {
+            sendActivity(child, sessionId, {
+              sessionUpdate: "available_commands_update",
+              availableCommands: [{ name: "too-long", description: "x".repeat(16 * 1024 + 1) }],
+            });
+          } else if (activityScenario === "malformed-usage") {
+            sendActivity(child, sessionId, { sessionUpdate: "usage_update", used: 1 });
           }
           return;
         }
-        const permissionId = `prompt-permission-${index}-${promptCount}`;
-        child.send({
-          jsonrpc: "2.0",
-          id: permissionId,
-          method: "session/request_permission",
-          params: permissionParams(sessionId, `Safe display ${index} turn ${promptCount}`),
-        });
-        const permission = await child.waitForResponse(permissionId);
-        child.permissionOutcome = permission.result?.outcome;
+        sendDiscardedSessionUpdates(child, sessionId, `prompt-${index}-${promptCount}`);
+        const permissionScenario = permissionScenarios.get(index);
+        const permissionRequests = permissionScenario?.requests ?? [{
+          id: `prompt-permission-${index}-${promptCount}`,
+          options: permissionOptions,
+        }];
+        child.permissionResponses ??= [];
+        for (const [requestIndex, request] of permissionRequests.entries()) {
+          child.send({
+            jsonrpc: "2.0",
+            id: request.id,
+            method: "session/request_permission",
+            params: permissionParams(
+              sessionId,
+              `Safe display ${index} turn ${promptCount} request ${requestIndex}`,
+              request.options,
+            ),
+          });
+          const permission = await child.waitForResponse(request.id);
+          child.permissionResponses.push(permission);
+          child.permissionOutcome = permission.result?.outcome;
+        }
+
+        if (permissionScenario?.callerTool) {
+          const mcp = await initializeMcp(mcpServerFromChild(child));
+          sendText(child, sessionId, "before automatic caller tool");
+          child.callerResult = await mcp.call("automatic-caller-key", 904);
+          sendText(child, sessionId, permissionScenario.responseText);
+          child.reply(message.id, { stopReason: "end_turn" });
+          return;
+        }
+
+        if (permissionScenario) {
+          // Agent-side tool activity is observational only. It cannot mint a
+          // caller tool_use or create an SDK-owned MCP call/receipt.
+          sendActivity(child, sessionId, toolCallActivity(`permission-${index}`));
+          sendText(child, sessionId, permissionScenario.responseText);
+          child.reply(message.id, { stopReason: "end_turn" });
+          return;
+        }
 
         if (index === 0) {
           for (const thought of thoughtUpdates("zero")) sendActivity(child, sessionId, thought);
@@ -376,6 +455,9 @@ function driverBehavior(agentErrors, activityScenarios) {
             ? (promptCount === 0 ? "Responses adapter output from session two" : "nonstream output from session two")
             : "nonstream output from session two");
           child.reply(message.id, { stopReason: "end_turn" });
+          // A context update may race with the response frame. It is
+          // session-owned housekeeping, not a late prompt text/tool event.
+          sendDiscardedSessionUpdates(child, sessionId, `terminal-${index}-${promptCount}`);
           return;
         }
         sendActivity(child, sessionId, thoughtUpdates("three")[0]);
@@ -402,10 +484,11 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
   const children = [];
   const agentErrors = [];
   const activityScenarios = new Map();
+  const permissionScenarios = new Map();
   const fakeSpawn = (_executable, _args, options) => {
     const index = children.length;
     const child = new FakeAcpChild(options, index, (message, current) =>
-      driverBehavior(agentErrors, activityScenarios)(message, current));
+      driverBehavior(agentErrors, activityScenarios, permissionScenarios)(message, current));
     children.push(child);
     return child;
   };
@@ -437,6 +520,8 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
   let authProcessFactoryCalls = 0;
   let strictSdk;
   let activitySdk;
+  let automaticPermissionsSdk;
+  let denyPermissionsSdk;
   const sdk = new api.AntigravitySDK({
     storageDir: join(root, "profiles"),
     executable: "/fake/agy-acp",
@@ -500,10 +585,14 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     assert.equal(children.every((child) => !Object.hasOwn(child.spawnOptions.env, "GOOGLE_API_KEY")), true);
     assert.equal(children.every((child) => child.spawnOptions.env.HOME !== "/ambient/must-not-cross"), true);
     await Promise.all(children.map((child, index) => child.waitForResponse(`startup-${index}`)));
-    assert.equal(callbackContexts.length, 0, "permissions without a live session owner default-deny without callback invocation");
+    assert.equal(callbackContexts.length, 0, "permissions without a live session owner fail closed without callback invocation");
 
     const mcpServers = [await sessions[0].tools.createMcpServer()];
     assert.equal(mcpServers[0].url.startsWith("http://127.0.0.1:"), true);
+    for (let index = 0; index < children.length; index += 1) {
+      sendDiscardedSessionUpdates(children[index], `remote-session-${index}`, `idle-${index}`);
+    }
+    await delay();
     const userMessages = sessions.map((_session, index) => ({ role: "user", content: `question-${index}` }));
 
     const toolMessage = await sessions[0].messages.create({ max_tokens: 17, messages: [userMessages[0]] });
@@ -663,6 +752,13 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     assert.equal(JSON.stringify(activitySnapshots).includes("private-thought"), false);
     assert.equal(JSON.stringify(activitySnapshots).includes("private-tool"), false);
     assert.equal(JSON.stringify(activitySnapshots).includes("secret-file"), false);
+    assert.equal(activitySnapshots.every(({ usage }) => usage.kind === "unknown"), true,
+      "session context occupancy never becomes per-operation Messages usage");
+    const discardedUpdateSecret = JSON.stringify({ toolMessage, completedToolMessage, streamEvents, textMessage, callbackContexts });
+    assert.equal(discardedUpdateSecret.includes("command-description-secret-"), false);
+    assert.equal(discardedUpdateSecret.includes("command-hint-secret-"), false);
+    assert.equal(discardedUpdateSecret.includes("command-meta-secret-"), false);
+    assert.equal(discardedUpdateSecret.includes("context-usage-secret-"), false);
     assert.equal(toolMessage.content.some((block) => block.type === "tool_use" && block.id.startsWith("activity-tool-")), false,
       "ACP tool-call activity cannot create caller tool authority");
 
@@ -762,6 +858,10 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
       ["unknown", api.ProtocolFailureError],
       ["event-cap", api.ProtocolFailureError],
       ["byte-cap", api.ProtocolFailureError],
+      ["foreign-command", api.ProtocolFailureError],
+      ["malformed-command", api.ProtocolFailureError],
+      ["oversized-command", api.ProtocolFailureError],
+      ["malformed-usage", api.ProtocolFailureError],
     ]) {
       const childIndex = children.length;
       activityScenarios.set(childIndex, scenario);
@@ -783,7 +883,152 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
       assert.equal(activityChild.ended, true);
     }
     await activitySdk.close();
+
+    const automaticRequests = [
+      {
+        id: "public-auto-prefers-first-always",
+        options: [
+          { optionId: "public-auto-once-before-always", name: "Allow once", kind: "allow_once" },
+          { optionId: "public-auto-always-first", name: "Always allow", kind: "allow_always" },
+          { optionId: "public-auto-always-second", name: "Also always allow", kind: "allow_always" },
+        ],
+      },
+      {
+        id: "public-auto-falls-back-once",
+        options: [
+          { optionId: "public-auto-once-first", name: "Allow once", kind: "allow_once" },
+          { optionId: "public-auto-once-second", name: "Also allow once", kind: "allow_once" },
+        ],
+      },
+      {
+        id: "public-auto-repeats-without-callback",
+        options: [
+          { optionId: "public-auto-repeat-always-first", name: "Always allow", kind: "allow_always" },
+          { optionId: "public-auto-repeat-always-second", name: "Also always allow", kind: "allow_always" },
+        ],
+      },
+    ];
+    const automaticChildIndex = children.length;
+    permissionScenarios.set(automaticChildIndex, {
+      requests: automaticRequests,
+      responseText: "automatic permission policy completed",
+      callerTool: true,
+    });
+    // Deliberately omit `permissions`: the packed/public SDK default must
+    // automatically select exact offered IDs without a caller callback.
+    automaticPermissionsSdk = new api.AntigravitySDK({
+      storageDir: join(root, "automatic-permission-profiles"),
+      executable: "/fake/agy-acp",
+      environment: { PATH: "/safe/test/path" },
+      maxTokensPolicy: "allow-unenforced-max-tokens",
+    });
+    const automaticAccount = await automaticPermissionsSdk.accounts.create();
+    const automaticSession = await automaticAccount.sessions.create({
+      model: "model-0",
+      cwd: "/workspace/public-auto-permissions",
+      tools: [{
+        name: "lookup",
+        input_schema: {
+          type: "object",
+          properties: { key: { type: "string" } },
+          required: ["key"],
+          additionalProperties: false,
+        },
+      }],
+    });
+    await automaticSession.tools.createMcpServer();
+    const automaticUser = { role: "user", content: "exercise the public automatic permission default" };
+    const automaticToolMessage = await automaticSession.messages.create({
+      max_tokens: 23,
+      messages: [automaticUser],
+    });
+    const automaticChild = children[automaticChildIndex];
+    assert.deepEqual(automaticToolMessage.content.map(({ type }) => type), ["text", "tool_use"],
+      "the fake ACP permission request alone is not a caller tool handoff; only the real MCP tools/call produces tool_use");
+    assert.equal(automaticToolMessage.content[0].text, "before automatic caller tool");
+    const automaticToolUse = automaticToolMessage.content.find(({ type }) => type === "tool_use");
+    assert.equal(automaticToolUse.name, "lookup");
+    assert.deepEqual(automaticToolUse.input, { key: "automatic-caller-key" });
+    assert.deepEqual(automaticChild.permissionResponses.map(({ id, result }) => ({
+      id,
+      outcome: result?.outcome,
+    })), [
+      {
+        id: "public-auto-prefers-first-always",
+        outcome: { outcome: "selected", optionId: "public-auto-always-first" },
+      },
+      {
+        id: "public-auto-falls-back-once",
+        outcome: { outcome: "selected", optionId: "public-auto-once-first" },
+      },
+      {
+        id: "public-auto-repeats-without-callback",
+        outcome: { outcome: "selected", optionId: "public-auto-repeat-always-first" },
+      },
+    ], "the ACP transport writes one response for each request, using the exact offered selection");
+    for (const [requestIndex, request] of automaticRequests.entries()) {
+      const response = automaticChild.permissionResponses[requestIndex];
+      assert.equal(request.options.some(({ optionId, kind }) =>
+        optionId === response?.result?.outcome?.optionId && (kind === "allow_always" || kind === "allow_once")), true,
+      "a positive selection is an exact ID/kind from that request's own offered options");
+      assert.equal(automaticChild.writes.filter(({ id }) => id === request.id).length, 1,
+        `permission request ${request.id} has exactly one outbound response`);
+    }
+    const automaticResponse = await automaticSession.messages.create({
+      max_tokens: 24,
+      messages: [automaticUser, { role: "assistant", content: automaticToolMessage.content }, {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: automaticToolUse.id, content: "authoritative caller result" }],
+      }],
+    });
+    assert.deepEqual(automaticResponse.content, [{ type: "text", text: "automatic permission policy completed" }]);
+    assert.deepEqual(automaticChild.callerResult?.result?.content, [
+      { type: "text", text: "authoritative caller result" },
+    ], "the ACP receives only the result admitted by the caller's SDK tool continuation");
+    const automaticHandoffs = await automaticSession.diagnostics.toolHandoffs();
+    assert.equal(automaticHandoffs.length, 1);
+    assert.equal(automaticHandoffs[0].name, "lookup");
+    assert.equal(automaticHandoffs[0].resultState, "acknowledged");
+    await automaticPermissionsSdk.close();
+    assert.equal(automaticChild.ended, true);
+
+    const denyRequests = [{
+      id: "public-explicit-deny",
+      options: [
+        { optionId: "public-deny-allow-always", name: "Always allow", kind: "allow_always" },
+        { optionId: "public-deny-reject-once", name: "Reject once", kind: "reject_once" },
+      ],
+    }];
+    const denyChildIndex = children.length;
+    permissionScenarios.set(denyChildIndex, {
+      requests: denyRequests,
+      responseText: "explicit deny policy completed",
+    });
+    denyPermissionsSdk = new api.AntigravitySDK({
+      storageDir: join(root, "deny-permission-profiles"),
+      executable: "/fake/agy-acp",
+      environment: { PATH: "/safe/test/path" },
+      maxTokensPolicy: "allow-unenforced-max-tokens",
+      permissions: { mode: "deny" },
+    });
+    const denyAccount = await denyPermissionsSdk.accounts.create();
+    const denySession = await denyAccount.sessions.create({ model: "model-0", cwd: "/workspace/public-deny-permissions" });
+    const denyResponse = await denySession.messages.create({
+      max_tokens: 23,
+      messages: [{ role: "user", content: "exercise explicit permission denial" }],
+    });
+    const denyChild = children[denyChildIndex];
+    assert.deepEqual(denyResponse.content, [{ type: "text", text: "explicit deny policy completed" }]);
+    assert.deepEqual(denyChild.permissionResponses.map(({ id, result }) => ({ id, outcome: result?.outcome })), [{
+      id: "public-explicit-deny",
+      outcome: { outcome: "selected", optionId: "public-deny-reject-once" },
+    }]);
+    await denyPermissionsSdk.close();
+    assert.equal(denyChild.ended, true);
+    assert.equal(agentErrors.length, 0, "automatic and explicit-deny fake ACP requests completed");
   } finally {
+    await denyPermissionsSdk?.close();
+    await automaticPermissionsSdk?.close();
     await activitySdk?.close();
     await strictSdk?.close();
     await sdk.close();

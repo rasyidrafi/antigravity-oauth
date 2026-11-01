@@ -41,3 +41,41 @@ Reviewer-informed adjustment plan: `ses_e6e989352ffeFLNfcEnJmznLPC`.
 | A4 | A1–A2 | `ses_e6d4473f0ffer8oCcpfMnRLlyH` | `ses_e6d2c6150ffeUwkDcTTVEHEljX` | passed bounded scope; reviewer verified exact known-token redaction and elapsed-deadline rejection. Implementer reported 325 tests on Node 26; the transport write race was queued as A5. |
 | A5 | A4 | `ses_e6d1e597bffeatt2vizqDT1mr5` | `ses_e6d0bc483ffec156DTxOwylTQ5` | passed mock scope; reviewer independently verified guarded FIFO write boundary, cancellation/timeout and response correlation. Implementer reported 337 tests and packed smoke on Node 24 and 26. |
 | A6 | A2–A5 | `ses_e6d09adccffe7ofOtl7TAbAEn3` | `ses_e6cf27060ffeuK7mJSfQCEqgSj` | passed complete mock integration; reviewer independently verified activity ordering, non-authoritative diagnostics and compilable adapter examples. Implementer reported 340 tests and packed smoke on Node 22.23.4 and 26.13.0. No live ACP/OAuth qualification claimed. |
+
+## Live qualification follow-up
+
+Reviewer-informed plan: `ses_e6a9f163fffe97ho1g1zkksqO4`. Official ACP 1.3.0 hashes matched; one isolated SDK account login succeeded. Raw ACP model discovery and a prompt returned `end_turn`; public SDK inference failed on an unhandled notification. On this host the official executable requires `--gid=nogroup`.
+
+| Slice | Dependencies | Implementer | Reviewer | Status |
+| --- | --- | --- | --- | --- |
+| B1 | A6 | `ses_e6a9d1c15ffelS3o1V97GLx0Gm` | `ses_e6a9298e8ffeRvv29xBVA3YPx3` | passed mock review; 349 tests and packed smoke reported on Node 26. Parent verified one live public-SDK nonstreaming inference with explicit unenforced-limit disclosure. |
+| B2 | B1 | `ses_e6a90e66affeJqr2LmAGzE4F3a` | `ses_e6a820d4affeuVqxlQyAtremlB` | passed mock review and upstream schema comparison; implementer reported 361 tests and packed smoke on Node 26. |
+| B3 | B2 | `ses_e6a7cb742ffeMLS88Cg1dPXvk0` | `ses_e6a787e33ffeg44rRN5QmFhFZ8` | passed bounded mock review; live default-deny observed, positive permission/tool path requires explicit human authorization. |
+| B4 | B3 | `ses_e6a7578e3ffekC0UGzq7CTUkv9` | `ses_e6a6eeebeffeBoPZsVUbq4A6TN` | partial live qualification: login, native nonstream/stream continuation, Chat and Responses nonstream, strict denial, old default permission denial, and after T1 auto permission plus custom MCP tool handoff/result/continuation observed. README evidence updated and independently re-reviewed. |
+| B5 | B4 | `ses_e6a0dfa6dffeQEjDpHjC1ifnJi` | `ses_e6a0177f4ffeZ49dYsxGCW8C7n` | scoped documentation review passed: two user-attested distinct Google accounts logged into separate SDK profiles; concurrent live tool handoffs were isolated, foreign result rejected; native tool streaming, both adapter streams and native cancellation succeeded. Identity was not independently verified; refresh/logout untested. Implementer reports 371 tests and packed smoke on Node 22/26. |
+
+## User-authorized permission-default change
+
+The user explicitly superseded the earlier default-deny and one-shot-only permission contract: the built-in ACP driver should automatically select an offered `allow_always` by default, without asking. This can authorize arbitrary agent-side effects and may create backend-persistent grants beyond the SDK/session. ACP request origin is unverified; cancellation cannot retract already written or persisted grants. Provide an explicit deny mode and preserve guarded write/cancellation. `PLAN.md` remains the historical translation. Reviewer-informed plan: `ses_e6a69a797ffeZNyE0oov0FYR11`.
+
+| Slice | Dependencies | Implementer | Reviewer | Status |
+| --- | --- | --- | --- | --- |
+| P1 | B4 partial | `ses_e6a67c02dffef7goG5fetC80oz` | `ses_e6a5f938fffeK6IXDl8X6zpN7Q` | passed contract review; 365 tests and packed smoke reported. Auto approval staged until P2. |
+| P2 | P1 | `ses_e6a5e6667ffe3jcp5m9SECWhwH` | `ses_e6a516babfferLGnzC4Cas57wu` | passed bounded review; implementer reports 370 tests and packed smoke on Node 26. |
+| P3 | P2 | `ses_e6a502f1fffeu783WifCaCBI4i` | `ses_e6a4128ddffezaUNh4IK3rwPuA` | passed integration review; implementer reports 370 tests and packed smoke on Node 22/26. Live permission/tool path and multi-account/refresh remain unqualified. |
+
+Live caller-tool trace (sanitized, parent): official ACP MCP initialization and `tools/list` succeeded. The actual MCP tool permission contained `_meta.mcp` keys `server` and `tool`; SDK validation rejected it and sent `cancelled`. A separate valid permission received `allow_always`. Thus the tool denial is a concrete metadata compatibility mismatch, not proof that the built-in tool filter should be relaxed. Reviewer investigation `ses_e6a3ee269ffeU8oDraYAlwIaS4` established the filter only governs host built-ins and must remain enabled.
+
+| Slice | Dependencies | Implementer | Reviewer | Status |
+| --- | --- | --- | --- | --- |
+| T1 | P3 | `ses_e6a3bb0b1ffeQVLwPXoFw8Sc0n` | `ses_e6a34896cffeKjcOJ6Iw6H9aMh` | passed bounded review; implementer reports 371 tests and packed smoke on Node 26. Parent verified official ACP MCP tool_use, caller-supplied unique result and model continuation with automatic permission. |
+
+## Distribution usability follow-up
+
+Parent independently observed npm registry returns 404 for `antigravity-oauth-sdk`; the documented npm install command is not yet available. A clean install from `git+https://github.com/rasyidrafi/antigravity-oauth.git` installed successfully but root import failed `ERR_MODULE_NOT_FOUND` because ignored `dist/` is not built on Git installation. Do not publish a package or push without appropriate authorization.
+
+| Slice | Dependencies | Implementer | Reviewer | Status |
+| --- | --- | --- | --- | --- |
+| D1 | B5, T1 | `ses_e69ff84ebffe4qJ9igZUmqN4tz` | `ses_e69f3962cffeMrgsgrVkgS6uzR` | passed scoped review; implementer reports 371 tests, packed and Git-install smoke on Node 22/26. Git-source smoke uses the public npm registry for build dependencies. |
+
+Final cross-slice working-tree review: `ses_e69f28804ffeLIYVATiHywilm9` passed code and local Git-packaging scope, without independently accessing credentials or rerunning filesystem-writing suites. Live evidence is limited to official ACP 1.3.0 Linux x64 and `gemini-3.8-flash-low`; Google account distinction is user-attested, not independently established. Logout, refresh, hard output-token enforcement, and broad production or cross-process isolation remain unqualified. The npm package is unpublished.

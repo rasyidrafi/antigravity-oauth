@@ -12,6 +12,7 @@ import {
 import type { ProcessFactory } from "./acp.js";
 import { createAcpSessionDriverFactory } from "./acp-session-driver.js";
 import type {
+  AcpPermissionPolicy,
   AcpPermissionsOptions,
   Account,
   AccountSessions,
@@ -35,6 +36,7 @@ import {
   type ProfileRegistryOptions,
 } from "./profiles.js";
 import { createProfileSessionEngine } from "./session.js";
+import { normalizeAcpPermissionPolicy } from "./acp-permissions.js";
 
 /** Injectable registry initialization seam, primarily useful for offline lifecycle tests. */
 export type ProfileRegistryFactory = (
@@ -56,7 +58,16 @@ export interface AntigravitySDKOptions {
   readonly environment?: EnvironmentSource;
   /** Output-token policy; defaults to strict fail-closed behavior. */
   readonly maxTokensPolicy?: MaxTokensPolicy;
-  /** Opt-in caller decision callback for ambiguous ACP permissions; default is denial. */
+  /**
+   * Built-in ACP permission policy. Omission normalizes to `mode: "auto"`;
+   * this automatically selects an offered `allow_always`, falling back to
+   * `allow_once`. ACP origin is unverified, approvals may authorize arbitrary
+   * agent-side effects, and `allow_always` may persist beyond this SDK/session.
+   * The SDK cannot revoke a previously written approval or ACP-side persistent
+   * grant; `{ mode: "deny" }` rejects subsequent requests only. Use it to opt
+   * out. A custom driver owns its permission policy; explicitly combining it
+   * with this option is rejected.
+   */
   readonly permissions?: AcpPermissionsOptions;
   /** ACP process seam used only by explicit authentication; never used by the built-in session driver. */
   readonly processFactory?: ProcessFactory;
@@ -65,7 +76,9 @@ export interface AntigravitySDKOptions {
    * allowlisted ACP session and selects the pinned model. Under strict policy
    * it refuses inference without verified output-token enforcement; the
    * explicit compatibility policy permits Messages prompts but reports that
-   * ACP does not enforce the requested `max_tokens` bound.
+   * ACP does not enforce the requested `max_tokens` bound. Custom drivers own
+   * their own permission behavior; omission of `permissions` does not impose
+   * the built-in automatic policy on them.
    */
   readonly sessionDriverFactory?: SessionDriverFactory;
   /** Registry initialization seam; production defaults to createProfileRegistry. */
@@ -96,9 +109,6 @@ const SAFE_ENVIRONMENT_KEYS = [
   "PATHEXT",
 ] as const;
 
-const DEFAULT_PERMISSION_TIMEOUT_MS = 10_000;
-const MAX_PERMISSION_TIMEOUT_MS = 60_000;
-
 function invalidOptions(): InvalidRequestError {
   return new InvalidRequestError("The AntigravitySDK options are invalid.");
 }
@@ -116,22 +126,6 @@ function hasOnlyDataProperties(value: Record<string, unknown>, allowed: readonly
     if (!descriptor?.enumerable || !("value" in descriptor)) return false;
   }
   return true;
-}
-
-function copyPermissionOptions(value: unknown): AcpPermissionsOptions | undefined {
-  if (value === undefined) return undefined;
-  if (!isRecord(value) || !hasOnlyDataProperties(value, ["onRequest", "timeoutMs"]) ||
-      typeof value.onRequest !== "function") {
-    throw invalidOptions();
-  }
-  const timeoutMs = value.timeoutMs === undefined ? DEFAULT_PERMISSION_TIMEOUT_MS : value.timeoutMs;
-  if (!Number.isSafeInteger(timeoutMs) || (timeoutMs as number) < 1 || (timeoutMs as number) > MAX_PERMISSION_TIMEOUT_MS) {
-    throw invalidOptions();
-  }
-  return Object.freeze({
-    onRequest: value.onRequest as AcpPermissionsOptions["onRequest"],
-    timeoutMs: timeoutMs as number,
-  });
 }
 
 function copyExplicitEnvironment(source: EnvironmentSource | undefined): EnvironmentSource {
@@ -156,7 +150,6 @@ function validateOptions(options: AntigravitySDKOptions): {
   readonly environment: EnvironmentSource;
   readonly processFactory: ProcessFactory | undefined;
   readonly maxTokensPolicy: MaxTokensPolicy;
-  readonly permissions: AcpPermissionsOptions | undefined;
   readonly sessionDriverFactory: SessionDriverFactory;
   readonly profileRegistryFactory: ProfileRegistryFactory;
 } {
@@ -196,13 +189,13 @@ function validateOptions(options: AntigravitySDKOptions): {
 
   const args = Object.freeze([...(options.args ?? [])]);
   const maxTokensPolicy = options.maxTokensPolicy ?? "strict";
-  const permissions = copyPermissionOptions(options.permissions);
-  if (permissions !== undefined && options.sessionDriverFactory !== undefined) throw invalidOptions();
+  const permissions: AcpPermissionPolicy = normalizeAcpPermissionPolicy(options.permissions);
+  if (options.permissions !== undefined && options.sessionDriverFactory !== undefined) throw invalidOptions();
   const defaultDriver = createAcpSessionDriverFactory({
     executable: options.executable,
     args,
     maxTokensPolicy,
-    ...(permissions === undefined ? {} : { permissions }),
+    permissions,
   });
   return Object.freeze({
     storageDir: options.storageDir,
@@ -212,7 +205,6 @@ function validateOptions(options: AntigravitySDKOptions): {
     environment: copyExplicitEnvironment(options.environment),
     processFactory: options.processFactory,
     maxTokensPolicy,
-    permissions,
     sessionDriverFactory: options.sessionDriverFactory ?? defaultDriver,
     profileRegistryFactory: options.profileRegistryFactory ?? createProfileRegistry,
   });

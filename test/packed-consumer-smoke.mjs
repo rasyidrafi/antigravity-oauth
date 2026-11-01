@@ -133,6 +133,7 @@ async function createConsumer(name) {
 try {
   const packed = JSON.parse(runNpm(["pack", "--ignore-scripts", "--json", "--pack-destination", artifacts]))[0];
   const packedPaths = packed.files.map(({ path }) => path);
+  assert.equal(packedPaths.includes("README.md"), true, "the published package must include its permission safety documentation");
   assert.equal(packedPaths.some((path) => path.startsWith("test/")), false,
     "the private ACP process/hash mock harness must not enter the published package");
   const tarball = join(artifacts, packed.filename);
@@ -146,6 +147,36 @@ try {
     "install", "--prefix", adapterConsumer, "--ignore-scripts", "--no-audit", "--no-fund",
     tarball, "@zenmux/rosetta-ai@1.0.38",
   ]);
+
+  const packedReadme = await readFile(join(coreConsumer, "node_modules", manifest.name, "README.md"), "utf8");
+  const normalizedPackedReadme = packedReadme.replace(/^>\s?/gmu, "").replace(/\s+/gu, " ");
+  for (const requiredNotice of [
+    "This project is not published to the npm registry",
+    "`npm install antigravity-oauth-sdk` will not work",
+    "After the desired commit has been pushed to the public repository",
+    "git+https://github.com/rasyidrafi/antigravity-oauth.git",
+    "the package's `prepare` lifecycle",
+    "With `--ignore-scripts`, `dist/` is not generated",
+    "local, unpushed changes are not included",
+    "omitting `permissions` selects automatic approval",
+    "first offered `allow_always`",
+    "first offered `allow_once`",
+    "ACP request origin is",
+    "unverified",
+    "arbitrary agent-side effects",
+    "The SDK has no API to revoke",
+    "This setting does not control any prompting or persistence implemented by the ACP agent",
+    "`permissions: { mode: \"deny\" }`",
+    "custom `sessionDriverFactory` owns its permission policy",
+    "callback form remains available",
+    "one exact offered `allow_once`",
+    "callbacks can never select `allow_always`",
+  ]) {
+    assert.equal(normalizedPackedReadme.includes(requiredNotice), true,
+      `the packed README must document ${requiredNotice}`);
+  }
+  assert.equal(normalizedPackedReadme.includes("does not prompt for a future decision"), false,
+    "published documentation must not imply backend prompts or persistence cannot recur");
 
   const coreConsumerManifestPath = join(coreConsumer, "package.json");
   const coreConsumerManifest = JSON.parse(await readFile(coreConsumerManifestPath, "utf8"));
@@ -231,6 +262,8 @@ try {
     import {
       AntigravitySDK,
       messageMaxTokensEnforcement,
+      type AcpPermissionHandler,
+      type AcpPermissionsOptions,
       type MaxTokensEnforcementDiagnostic,
       type Message,
     } from "antigravity-oauth-sdk";
@@ -240,9 +273,22 @@ try {
     const diagnostic: MaxTokensEnforcementDiagnostic | undefined = message
       ? messageMaxTokensEnforcement(message)
       : undefined;
+    const automaticPermissions: AcpPermissionsOptions = { mode: "auto" };
+    const deniedPermissions: AcpPermissionsOptions = { mode: "deny" };
+    const handler: AcpPermissionHandler = () => ({ action: "deny" });
+    const callbackPermissions: AcpPermissionsOptions = { onRequest: handler };
+    // @ts-expect-error automatic mode and caller callbacks are mutually exclusive.
+    const invalidMixedPermissions: AcpPermissionsOptions = { mode: "auto", onRequest: handler };
+    // @ts-expect-error callback mode can select only one-shot permissions and has no explicit mode.
+    const invalidCallbackMode: AcpPermissionsOptions = { mode: "deny", onRequest: handler };
     void account;
     void message;
     void diagnostic;
+    void automaticPermissions;
+    void deniedPermissions;
+    void callbackPermissions;
+    void invalidMixedPermissions;
+    void invalidCallbackMode;
     void sdk;
   `;
   await writeFile(join(coreConsumer, "consumer-types.ts"), coreTypeSource);
@@ -288,7 +334,7 @@ try {
   ], adapterConsumer);
 
   console.log(`Packed consumer smoke passed: ${packed.filename}; Node ${process.versions.node}.`);
-  console.log("Verified: optional peer absent for core; root import does not resolve Rosetta; constructor is inert; default driver fails closed; built-in compatibility/permission path composes from the packed root using only in-memory fake ACP/MCP; Chat nonstream and Responses stream disclose not-enforced from that same driver when the pinned peer is installed; no public server/inference export; Chat/Responses imports and declarations resolve with @zenmux/rosetta-ai@1.0.38.");
+  console.log("Verified: packed permission docs/default types; optional peer absent for core; root import does not resolve Rosetta; constructor is inert; default driver fails closed; built-in compatibility, automatic/deny/callback permission paths compose from the packed root using only in-memory fake ACP/MCP; Chat nonstream and Responses stream disclose not-enforced from that same driver when the pinned peer is installed; no public server/inference export; Chat/Responses imports and declarations resolve with @zenmux/rosetta-ai@1.0.38.");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

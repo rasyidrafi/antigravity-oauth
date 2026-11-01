@@ -4,7 +4,9 @@ import { AcpMethodNotFoundError, connectAcp, type AcpConnection, type ProcessFac
 import { createGuardedPermissionResponse } from "./acp-permission-response.js";
 import { assertReviewedAcpPair } from "./acp-compatibility.js";
 import { createNoninteractiveAuthGuard, type NoninteractiveAuthGuard } from "./noninteractive-auth.js";
+import { normalizeAcpPermissionPolicy } from "./acp-permissions.js";
 import type {
+  AcpPermissionPolicy,
   AcpPermissionsOptions,
   AcpPermissionRequestDetails,
   AcpTextBlock,
@@ -26,6 +28,16 @@ import type {
 const DEFAULT_MODEL_CONFIRMATION_TIMEOUT_MS = 30_000;
 const MAX_NOTIFICATION_COUNT = 256;
 const MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024;
+const MAX_PRE_SESSION_NOTIFICATION_COUNT = MAX_NOTIFICATION_COUNT;
+const MAX_PRE_SESSION_NOTIFICATION_BYTES = MAX_NOTIFICATION_BYTES;
+const MAX_DISCARDED_SESSION_UPDATE_BYTES = 256 * 1024;
+const MAX_AVAILABLE_COMMANDS = 256;
+const MAX_AVAILABLE_COMMAND_TEXT_BYTES = 16 * 1024;
+const MAX_PLAN_ENTRIES = 256;
+const MAX_CONFIG_OPTIONS = 256;
+const MAX_CONFIG_OPTION_VALUES = 2_048;
+const MAX_IDLE_DISCARDED_UPDATE_COUNT = 65_536;
+const MAX_IDLE_DISCARDED_UPDATE_BYTES = 8 * 1024 * 1024;
 const MAX_PROMPT_QUEUE_EVENTS = 256;
 const MAX_PROMPT_QUEUE_BYTES = 4 * 1024 * 1024;
 const MAX_PROMPT_EVENTS = 65_536;
@@ -36,7 +48,6 @@ const MAX_ACTIVITY_DIAGNOSTIC_COUNT = 65_536;
 // Leave headroom inside the session engine's default one-second cleanup
 // deadline for bounded ACP transport termination and profile-guard disposal.
 const PROMPT_CLEANUP_TIMEOUT_MS = 150;
-const DEFAULT_PERMISSION_CALLBACK_TIMEOUT_MS = 10_000;
 const MAX_PERMISSION_CALLBACK_TIMEOUT_MS = 60_000;
 const MAX_CONCURRENT_PERMISSION_CALLBACKS = 8;
 const MAX_PERMISSION_DETAIL_BYTES = 256;
@@ -51,8 +62,8 @@ export interface AcpSessionDriverFactoryOptions {
   readonly args: readonly string[];
   /** Immutable policy copied from the owning SDK. */
   readonly maxTokensPolicy?: MaxTokensPolicy;
-  /** Immutable, opt-in caller approval callback for one-shot ACP permission requests. */
-  readonly permissions?: AcpPermissionsOptions;
+  /** Frozen normalized built-in permission policy selected by the SDK. */
+  readonly permissions: AcpPermissionPolicy;
 }
 
 interface DriverOptions {
@@ -187,7 +198,7 @@ interface ActivePromptTurn {
   initialAbortCleanup?: () => void;
 }
 
-interface PendingPermissionCallback {
+interface PendingPermissionDecision {
   readonly turn: ActivePromptTurn;
   readonly operationId: string;
   readonly controller: AbortController;
@@ -249,9 +260,11 @@ function validOptionalJsonMeta(value: unknown): boolean {
 }
 
 /**
- * ACP v1 doesn't define an MCP-server field on permission requests. Validate
- * the optional `_meta.mcp.server` convention for shape only; ACP leaves
- * `_meta` opaque and it is never treated as provenance or authority.
+ * ACP leaves `_meta` opaque. The pinned Antigravity ACP 1.3.0 worker was
+ * observed sending `_meta.mcp` with `server` and `tool`; retain the previously
+ * accepted server-only shape as well. Validate these bounded strings for
+ * syntax only: neither value is retained, shown to callers, or used as proof
+ * of origin, tool identity, or permission authority.
  */
 function validatePermissionRequest(value: unknown): ValidPermissionRequest | undefined {
   if (!isRecord(value) || !onlyKeys(value, ["sessionId", "toolCall", "options", "_meta"]) ||
@@ -279,7 +292,11 @@ function validatePermissionRequest(value: unknown): ValidPermissionRequest | und
 
   if (isRecord(toolCall._meta) && Object.hasOwn(toolCall._meta, "mcp")) {
     const mcp = toolCall._meta.mcp;
-    if (!isRecord(mcp) || !exactKeys(mcp, ["server"]) || !validAcpIdentifier(mcp.server)) return undefined;
+    if (!isRecord(mcp)) return undefined;
+    const serverOnly = exactKeys(mcp, ["server"]) && validAcpIdentifier(mcp.server);
+    const serverAndTool = exactKeys(mcp, ["server", "tool"]) &&
+      validAcpIdentifier(mcp.server) && validAcpIdentifier(mcp.tool);
+    if (!serverOnly && !serverAndTool) return undefined;
   }
 
   const optionIds = new Set<string>();
@@ -401,6 +418,33 @@ function permissionResponse(
     : Object.freeze({ outcome: Object.freeze({ outcome: "cancelled" }) });
 }
 
+/**
+ * Resolve an automatic/callback allow only when the exact option ID and kind
+ * are still present in the validated offer. Caller callbacks are separately
+ * restricted to `allow_once`; only the built-in automatic policy can request
+ * `allow_always` here.
+ */
+function selectedAllowPermissionResponse(
+  options: ValidPermissionRequest["options"],
+  optionId: string,
+  kind: "allow_once" | "allow_always",
+): Readonly<Record<string, unknown>> | undefined {
+  const selected = options.find((option) => option.optionId === optionId && option.kind === kind);
+  return selected
+    ? Object.freeze({ outcome: Object.freeze({ outcome: "selected", optionId: selected.optionId }) })
+    : undefined;
+}
+
+function automaticPermissionSelection(
+  request: ValidPermissionRequest,
+): { readonly optionId: string; readonly kind: "allow_always" | "allow_once" } | undefined {
+  const selected = request.options.find(({ kind }) => kind === "allow_always") ??
+    request.options.find(({ kind }) => kind === "allow_once");
+  return selected && (selected.kind === "allow_always" || selected.kind === "allow_once")
+    ? Object.freeze({ optionId: selected.optionId, kind: selected.kind })
+    : undefined;
+}
+
 function validJsonRecord(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
   return validJsonValue(value);
@@ -471,6 +515,289 @@ function boundedAcpText(value: unknown, maximumBytes = 4_096): value is string {
 
 function validNullableText(value: unknown, maximumBytes = 4_096): boolean {
   return value === null || boundedAcpText(value, maximumBytes);
+}
+
+function validatePlanEntry(value: unknown): void {
+  if (!isRecord(value) || !onlyKeys(value, ["content", "priority", "status", "_meta"]) ||
+      !Object.hasOwn(value, "content") || !boundedAcpText(value.content, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+      !Object.hasOwn(value, "priority") ||
+      (value.priority !== "high" && value.priority !== "medium" && value.priority !== "low") ||
+      !Object.hasOwn(value, "status") ||
+      (value.status !== "pending" && value.status !== "in_progress" && value.status !== "completed")) {
+    throw new ProtocolFailureError("ACP plan entry is malformed or oversized.");
+  }
+  if (Object.hasOwn(value, "_meta")) validateMeta(value._meta, "plan entry");
+}
+
+function validatePlanEntries(value: unknown): void {
+  if (!Array.isArray(value) || value.length > MAX_PLAN_ENTRIES) {
+    throw new ProtocolFailureError("ACP plan entries are malformed or oversized.");
+  }
+  for (const entry of value) validatePlanEntry(entry);
+}
+
+function validateConfigSelectOption(value: unknown): void {
+  if (!isRecord(value) || !onlyKeys(value, ["value", "name", "description", "_meta"]) ||
+      !Object.hasOwn(value, "value") || !boundedAcpText(value.value, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+      !Object.hasOwn(value, "name") || !boundedAcpText(value.name, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+      (Object.hasOwn(value, "description") && !validNullableText(value.description, MAX_AVAILABLE_COMMAND_TEXT_BYTES)) ||
+      (Object.hasOwn(value, "_meta") && !validOptionalJsonMeta(value._meta))) {
+    throw new ProtocolFailureError("ACP configuration option value is malformed or oversized.");
+  }
+}
+
+function validateConfigOption(value: unknown, optionValueBudget: { count: number }): void {
+  if (!isRecord(value) || !onlyKeys(value, [
+    "id", "type", "currentValue", "options", "name", "description", "category", "_meta",
+  ]) || !Object.hasOwn(value, "id") || !boundedAcpText(value.id, 512) ||
+      !Object.hasOwn(value, "name") || !boundedAcpText(value.name, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+      (Object.hasOwn(value, "description") && !validNullableText(value.description, MAX_AVAILABLE_COMMAND_TEXT_BYTES)) ||
+      (Object.hasOwn(value, "category") && !validNullableText(value.category, 512)) ||
+      (Object.hasOwn(value, "_meta") && !validOptionalJsonMeta(value._meta))) {
+    throw new ProtocolFailureError("ACP session configuration option is malformed or oversized.");
+  }
+
+  if (value.type === "select") {
+    if (!Object.hasOwn(value, "currentValue") || !boundedAcpText(value.currentValue, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+        !Object.hasOwn(value, "options") || !Array.isArray(value.options) ||
+        value.options.length > MAX_CONFIG_OPTION_VALUES) {
+      throw new ProtocolFailureError("ACP selectable configuration option is malformed or oversized.");
+    }
+    optionValueBudget.count += value.options.length;
+    if (optionValueBudget.count > MAX_CONFIG_OPTION_VALUES) {
+      throw new ProtocolFailureError("ACP configuration option values exceeded their bounded count.");
+    }
+    if (value.options.length === 0 || !isRecord(value.options[0]) || Object.hasOwn(value.options[0], "value")) {
+      for (const option of value.options) validateConfigSelectOption(option);
+      return;
+    }
+    for (const group of value.options) {
+      if (!isRecord(group) || !onlyKeys(group, ["group", "name", "options", "_meta"]) ||
+          !Object.hasOwn(group, "group") || !boundedAcpText(group.group, 512) ||
+          !Object.hasOwn(group, "name") || !boundedAcpText(group.name, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+          !Object.hasOwn(group, "options") || !Array.isArray(group.options) ||
+          group.options.length > MAX_CONFIG_OPTION_VALUES ||
+          (Object.hasOwn(group, "_meta") && !validOptionalJsonMeta(group._meta))) {
+        throw new ProtocolFailureError("ACP grouped configuration options are malformed or oversized.");
+      }
+      optionValueBudget.count += group.options.length;
+      if (optionValueBudget.count > MAX_CONFIG_OPTION_VALUES) {
+        throw new ProtocolFailureError("ACP configuration option values exceeded their bounded count.");
+      }
+      for (const option of group.options) validateConfigSelectOption(option);
+    }
+    return;
+  }
+
+  if (value.type !== "boolean" || !Object.hasOwn(value, "currentValue") || typeof value.currentValue !== "boolean" ||
+      Object.hasOwn(value, "options")) {
+    throw new ProtocolFailureError("ACP boolean configuration option is malformed.");
+  }
+}
+
+interface ValidModelConfigSelection {
+  readonly configId: string;
+  readonly value: string;
+}
+
+/** ACP v1 config_option_update carries the complete configuration option list. */
+function validateConfigOptionUpdate(
+  update: Record<string, unknown>,
+  selectedModelConfigId: string | undefined,
+): { readonly bytes: number; readonly selected?: ValidModelConfigSelection } {
+  if (!onlyKeys(update, ["sessionUpdate", "configOptions", "_meta"]) ||
+      !Object.hasOwn(update, "configOptions") || !Array.isArray(update.configOptions) ||
+      update.configOptions.length > MAX_CONFIG_OPTIONS) {
+    throw new ProtocolFailureError("ACP configuration update is malformed or oversized.");
+  }
+  if (Object.hasOwn(update, "_meta")) validateMeta(update._meta, "configuration update");
+
+  const optionValueBudget = { count: 0 };
+  const ids = new Set<string>();
+  const options: Record<string, unknown>[] = [];
+  for (const option of update.configOptions) {
+    validateConfigOption(option, optionValueBudget);
+    const validatedOption = option as Record<string, unknown>;
+    if (ids.has(validatedOption.id as string)) {
+      throw new ProtocolFailureError("ACP configuration update contains duplicate option IDs.");
+    }
+    ids.add(validatedOption.id as string);
+    options.push(validatedOption);
+  }
+
+  const modelTaggedOptions = options.filter((option) => option.category === "model" || option.id === "model");
+  const candidates = selectedModelConfigId === undefined
+    ? modelTaggedOptions
+    : options.filter((option) => option.id === selectedModelConfigId);
+  if (selectedModelConfigId !== undefined &&
+      modelTaggedOptions.some((option) => option.id !== selectedModelConfigId)) {
+    throw new ProtocolFailureError("ACP configuration update introduced an ambiguous model selector.");
+  }
+  if (candidates.length > 1) {
+    throw new ProtocolFailureError("ACP configuration update contains an ambiguous model selector.");
+  }
+  const selector = candidates[0];
+  let selected: ValidModelConfigSelection | undefined;
+  if (selector) {
+    if (selector.type !== "select" || typeof selector.currentValue !== "string" || !Array.isArray(selector.options)) {
+      throw new ProtocolFailureError("ACP model configuration update has no selectable model value.");
+    }
+    const allowedValues: string[] = [];
+    for (const option of selector.options) {
+      if (isRecord(option) && typeof option.value === "string") {
+        allowedValues.push(option.value);
+      } else if (isRecord(option) && Array.isArray(option.options)) {
+        for (const groupOption of option.options) {
+          if (isRecord(groupOption) && typeof groupOption.value === "string") allowedValues.push(groupOption.value);
+        }
+      }
+    }
+    if (!allowedValues.includes(selector.currentValue)) {
+      throw new ProtocolFailureError("ACP model configuration update selected a value that is not advertised.");
+    }
+    selected = Object.freeze({ configId: selector.id as string, value: selector.currentValue });
+  }
+  if (selectedModelConfigId !== undefined && !selected) {
+    throw new ProtocolFailureError("ACP configuration update omitted the session's pinned model selector.");
+  }
+
+  const bytes = serializedNotificationBytes({ update });
+  if (bytes > MAX_DISCARDED_SESSION_UPDATE_BYTES) {
+    throw new ProtocolFailureError("ACP configuration update exceeded its bounded payload size.");
+  }
+  return Object.freeze({ bytes, ...(selected === undefined ? {} : { selected }) });
+}
+
+/**
+ * Validate ACP v1 progress/session housekeeping that has no Messages mapping.
+ * These updates are observational only; command and plan metadata do not
+ * create tool authority, and context occupancy is not per-operation usage.
+ */
+function measureDiscardedSessionUpdate(update: Record<string, unknown>): number {
+  const validateUpdateMeta = (): void => {
+    if (Object.hasOwn(update, "_meta")) validateMeta(update._meta, "session update");
+  };
+
+  if (update.sessionUpdate === "available_commands_update") {
+    if (!onlyKeys(update, ["sessionUpdate", "availableCommands", "_meta"]) ||
+        !Object.hasOwn(update, "availableCommands") || !Array.isArray(update.availableCommands) ||
+        update.availableCommands.length > MAX_AVAILABLE_COMMANDS) {
+      throw new ProtocolFailureError("ACP available-commands update is malformed or oversized.");
+    }
+    validateUpdateMeta();
+    for (const command of update.availableCommands) {
+      if (!isRecord(command) || !onlyKeys(command, ["name", "description", "input", "_meta"]) ||
+          !Object.hasOwn(command, "name") || !boundedAcpText(command.name, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+          !Object.hasOwn(command, "description") ||
+          !boundedAcpText(command.description, MAX_AVAILABLE_COMMAND_TEXT_BYTES)) {
+        throw new ProtocolFailureError("ACP available command is malformed or oversized.");
+      }
+      if (Object.hasOwn(command, "_meta")) validateMeta(command._meta, "available command");
+      if (Object.hasOwn(command, "input") && command.input !== null) {
+        if (!isRecord(command.input) || !onlyKeys(command.input, ["hint", "_meta"]) ||
+            !Object.hasOwn(command.input, "hint") ||
+            !boundedAcpText(command.input.hint, MAX_AVAILABLE_COMMAND_TEXT_BYTES) ||
+            (Object.hasOwn(command.input, "_meta") && !validOptionalJsonMeta(command.input._meta))) {
+          throw new ProtocolFailureError("ACP available command input is malformed or oversized.");
+        }
+      }
+    }
+  } else if (update.sessionUpdate === "usage_update") {
+    if (!onlyKeys(update, ["sessionUpdate", "used", "size", "cost", "_meta"]) ||
+        !Object.hasOwn(update, "used") || typeof update.used !== "number" || !Number.isFinite(update.used) ||
+        !Object.hasOwn(update, "size") || typeof update.size !== "number" || !Number.isFinite(update.size)) {
+      throw new ProtocolFailureError("ACP usage update is malformed.");
+    }
+    validateUpdateMeta();
+    if (Object.hasOwn(update, "cost") && update.cost !== null) {
+      const cost = update.cost;
+      if (!isRecord(cost) || !onlyKeys(cost, ["amount", "currency", "_meta"]) ||
+          !Object.hasOwn(cost, "amount") || typeof cost.amount !== "number" || !Number.isFinite(cost.amount) ||
+          !Object.hasOwn(cost, "currency") || !boundedAcpText(cost.currency, 64) ||
+          (Object.hasOwn(cost, "_meta") && !validOptionalJsonMeta(cost._meta))) {
+        throw new ProtocolFailureError("ACP usage cost is malformed.");
+      }
+    }
+  } else if (update.sessionUpdate === "plan") {
+    if (!onlyKeys(update, ["sessionUpdate", "entries", "_meta"]) ||
+        !Object.hasOwn(update, "entries")) {
+      throw new ProtocolFailureError("ACP plan update is malformed.");
+    }
+    validateUpdateMeta();
+    validatePlanEntries(update.entries);
+  } else if (update.sessionUpdate === "plan_update") {
+    if (!onlyKeys(update, ["sessionUpdate", "plan", "_meta"]) ||
+        !Object.hasOwn(update, "plan") || !isRecord(update.plan)) {
+      throw new ProtocolFailureError("ACP plan content update is malformed.");
+    }
+    validateUpdateMeta();
+    const plan = update.plan;
+    if (plan.type === "items") {
+      if (!onlyKeys(plan, ["type", "planId", "entries", "_meta"]) ||
+          !Object.hasOwn(plan, "planId") || !boundedAcpText(plan.planId, 512) ||
+          !Object.hasOwn(plan, "entries")) {
+        throw new ProtocolFailureError("ACP item plan update is malformed.");
+      }
+      if (Object.hasOwn(plan, "_meta")) validateMeta(plan._meta, "plan update content");
+      validatePlanEntries(plan.entries);
+    } else if (plan.type === "file") {
+      if (!onlyKeys(plan, ["type", "planId", "uri", "_meta"]) ||
+          !Object.hasOwn(plan, "planId") || !boundedAcpText(plan.planId, 512) ||
+          !Object.hasOwn(plan, "uri") || !boundedAcpText(plan.uri, MAX_AVAILABLE_COMMAND_TEXT_BYTES)) {
+        throw new ProtocolFailureError("ACP file plan update is malformed or oversized.");
+      }
+      if (Object.hasOwn(plan, "_meta")) validateMeta(plan._meta, "plan update content");
+    } else if (plan.type === "markdown") {
+      if (!onlyKeys(plan, ["type", "planId", "content", "_meta"]) ||
+          !Object.hasOwn(plan, "planId") || !boundedAcpText(plan.planId, 512) ||
+          !Object.hasOwn(plan, "content") || !boundedAcpText(plan.content, MAX_AVAILABLE_COMMAND_TEXT_BYTES)) {
+        throw new ProtocolFailureError("ACP markdown plan update is malformed or oversized.");
+      }
+      if (Object.hasOwn(plan, "_meta")) validateMeta(plan._meta, "plan update content");
+    } else {
+      throw new ProtocolFailureError("ACP plan update uses an unsupported content variant.");
+    }
+  } else if (update.sessionUpdate === "plan_removed") {
+    if (!onlyKeys(update, ["sessionUpdate", "planId", "_meta"]) ||
+        !Object.hasOwn(update, "planId") || !boundedAcpText(update.planId, 512)) {
+      throw new ProtocolFailureError("ACP plan removal update is malformed.");
+    }
+    validateUpdateMeta();
+  } else if (update.sessionUpdate === "current_mode_update") {
+    if (!onlyKeys(update, ["sessionUpdate", "currentModeId", "_meta"]) ||
+        !Object.hasOwn(update, "currentModeId") || !boundedAcpText(update.currentModeId, 512)) {
+      throw new ProtocolFailureError("ACP current-mode update is malformed.");
+    }
+    validateUpdateMeta();
+  } else if (update.sessionUpdate === "session_info_update") {
+    if (!onlyKeys(update, ["sessionUpdate", "title", "updatedAt", "_meta"]) ||
+        (Object.hasOwn(update, "title") && !validNullableText(update.title, MAX_AVAILABLE_COMMAND_TEXT_BYTES)) ||
+        (Object.hasOwn(update, "updatedAt") && !validNullableText(update.updatedAt, 512))) {
+      throw new ProtocolFailureError("ACP session-info update is malformed or oversized.");
+    }
+    validateUpdateMeta();
+  } else {
+    throw new ProtocolFailureError("ACP session update is not a supported non-output housekeeping update.");
+  }
+
+  let bytes: number;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(update), "utf8");
+  } catch {
+    throw new ProtocolFailureError("ACP session update could not be measured within its resource bound.");
+  }
+  if (bytes > MAX_DISCARDED_SESSION_UPDATE_BYTES) {
+    throw new ProtocolFailureError("ACP session housekeeping update exceeded its bounded payload size.");
+  }
+  return bytes;
+}
+
+function serializedNotificationBytes(notification: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(notification), "utf8");
+  } catch {
+    throw new ProtocolFailureError("ACP notification could not be measured within its resource bound.");
+  }
 }
 
 /** ACP v1 ContentBlock/ToolCallContent unions are validated but never retained. */
@@ -828,7 +1155,7 @@ export function createAcpSessionDriverFactory(options: AcpSessionDriverFactoryOp
     modelConfirmationTimeoutMs: DEFAULT_MODEL_CONFIRMATION_TIMEOUT_MS,
     permissionCallbackBudget,
     ...(options.maxTokensPolicy === undefined ? {} : { maxTokensPolicy: options.maxTokensPolicy }),
-    ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
+    permissions: options.permissions,
   });
 }
 
@@ -841,6 +1168,7 @@ export function createFakeAcpSessionDriverFactory(options: TestFactoryOptions): 
   if (!options || typeof options.processFactory !== "function") {
     throw new InvalidRequestError("The fake ACP test factory requires a processFactory.");
   }
+  const permissions = normalizeAcpPermissionPolicy(options.permissions);
   const timeout = options.modelConfirmationTimeoutMs ?? DEFAULT_MODEL_CONFIRMATION_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000) {
     throw new InvalidRequestError("The fake ACP model verification timeout is invalid.");
@@ -850,7 +1178,7 @@ export function createFakeAcpSessionDriverFactory(options: TestFactoryOptions): 
     resolveExecutable: async (executable) => executable,
     modelConfirmationTimeoutMs: timeout,
     permissionCallbackBudget,
-    ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
+    permissions,
   });
 }
 
@@ -869,6 +1197,7 @@ export function createFakeEnforcingAcpSessionDriverFactory(
       ].includes(key))) {
     throw new InvalidRequestError("The fake enforcing ACP factory requires a processFactory and test enforcer.");
   }
+  const permissions = normalizeAcpPermissionPolicy(options.permissions);
   const timeout = options.modelConfirmationTimeoutMs ?? DEFAULT_MODEL_CONFIRMATION_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000) {
     throw new InvalidRequestError("The fake ACP model verification timeout is invalid.");
@@ -879,7 +1208,7 @@ export function createFakeEnforcingAcpSessionDriverFactory(
     modelConfirmationTimeoutMs: timeout,
     permissionCallbackBudget,
     enforceMaxTokens: options.enforceMaxTokens,
-    ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
+    permissions,
   });
 }
 
@@ -895,7 +1224,7 @@ async function createSessionDriver(
     readonly modelConfirmationTimeoutMs: number;
     readonly permissionCallbackBudget?: PermissionCallbackBudget;
     readonly maxTokensPolicy?: MaxTokensPolicy;
-    readonly permissions?: AcpPermissionsOptions;
+    readonly permissions: AcpPermissionPolicy;
     readonly enforceMaxTokens?: TestEnforcingFactoryOptions["enforceMaxTokens"];
   },
 ): Promise<SessionDriver> {
@@ -906,12 +1235,13 @@ async function createSessionDriver(
       (dependencies.maxTokensPolicy !== undefined && context.maxTokensPolicy !== dependencies.maxTokensPolicy)) {
     throw new InvalidRequestError("The ACP session driver context is invalid.");
   }
-  if (dependencies.permissions !== undefined) {
-    const timeoutMs = dependencies.permissions.timeoutMs ?? DEFAULT_PERMISSION_CALLBACK_TIMEOUT_MS;
-    if (typeof dependencies.permissions.onRequest !== "function" || !Number.isSafeInteger(timeoutMs) ||
-        timeoutMs < 1 || timeoutMs > MAX_PERMISSION_CALLBACK_TIMEOUT_MS) {
-      throw new InvalidRequestError("The ACP permission callback configuration is invalid.");
-    }
+  if (!dependencies.permissions ||
+      (dependencies.permissions.mode !== "auto" && dependencies.permissions.mode !== "deny" &&
+        dependencies.permissions.mode !== "callback") ||
+      !Number.isSafeInteger(dependencies.permissions.timeoutMs) ||
+      dependencies.permissions.timeoutMs < 1 || dependencies.permissions.timeoutMs > MAX_PERMISSION_CALLBACK_TIMEOUT_MS ||
+      (dependencies.permissions.mode === "callback" && typeof dependencies.permissions.onRequest !== "function")) {
+    throw new InvalidRequestError("The ACP permission policy configuration is invalid.");
   }
   const selectedExecutable = await dependencies.resolveExecutable(
     options.executable,
@@ -935,9 +1265,13 @@ async function createSessionDriver(
     toolCallUpdates: 0,
     capped: false,
   };
-  const pendingPermissionCallbacks = new Set<PendingPermissionCallback>();
+  const pendingPermissionDecisions = new Set<PendingPermissionDecision>();
   const permissionCallbackBudget = dependencies.permissionCallbackBudget ?? { active: 0 };
   const preSessionUpdateIds = new Set<string>();
+  let preSessionNotificationCount = 0;
+  let preSessionNotificationBytes = 0;
+  let idleDiscardedUpdateCount = 0;
+  let idleDiscardedUpdateBytes = 0;
   let startupPromise: Promise<void> | undefined;
   let boundServer: SessionMcpServer | undefined;
   let boundToolBinding: SessionDriverCallerToolBinding | undefined;
@@ -949,8 +1283,8 @@ async function createSessionDriver(
     ? "driver-admitted-requested-bound" as const
     : "backend-does-not-enforce-requested-bound" as const;
 
-  const abortPermissionCallbacks = (turn?: ActivePromptTurn, operationId?: string): void => {
-    for (const pending of pendingPermissionCallbacks) {
+  const abortPermissionDecisions = (turn?: ActivePromptTurn, operationId?: string): void => {
+    for (const pending of pendingPermissionDecisions) {
       if ((turn === undefined || pending.turn === turn) &&
           (operationId === undefined || pending.operationId === operationId)) {
         pending.controller.abort();
@@ -1041,33 +1375,44 @@ async function createSessionDriver(
     }
 
     const permissions = dependencies.permissions;
-    if (!permissions || permissionCallbackBudget.active >= MAX_CONCURRENT_PERMISSION_CALLBACKS) {
+    if (permissions.mode === "deny") {
       return permissionResponse(request.options, false);
     }
-    const knownSecrets = permissionEndpointSecrets();
-    const correlationValues = [
-      context.accountId,
-      context.sessionId,
-      operationId,
-      request.sessionId,
-      request.toolCallId,
-      ...(typeof requestId === "string" ? [requestId] : []),
-      ...request.options.map(({ optionId }) => optionId),
-    ];
-    if (knownSecrets.some((secret) => correlationValues.some((value) => value.includes(secret)))) {
-      // Correlation values and option IDs must stay exact for the ACP protocol;
-      // do not expose a known SDK secret through them to the caller callback.
+
+    const callbackMode = permissions.mode === "callback";
+    if (callbackMode && permissionCallbackBudget.active >= MAX_CONCURRENT_PERMISSION_CALLBACKS) {
       return permissionResponse(request.options, false);
+    }
+
+    // Automatic policy never projects ACP descriptions, MCP authorization
+    // values, or any other callback-only context. It also does not consume the
+    // per-SDK callback concurrency budget.
+    const knownSecrets = callbackMode ? permissionEndpointSecrets() : Object.freeze([]);
+    if (callbackMode) {
+      const correlationValues = [
+        context.accountId,
+        context.sessionId,
+        operationId,
+        request.sessionId,
+        request.toolCallId,
+        ...(typeof requestId === "string" ? [requestId] : []),
+        ...request.options.map(({ optionId }) => optionId),
+      ];
+      if (knownSecrets.some((secret) => correlationValues.some((value) => value.includes(secret)))) {
+        // Correlation values and option IDs must stay exact for the ACP protocol;
+        // do not expose a known SDK secret through them to the caller callback.
+        return permissionResponse(request.options, false);
+      }
     }
 
     const controller = new AbortController();
     const pending = Object.freeze({ turn, operationId, controller });
-    pendingPermissionCallbacks.add(pending);
+    pendingPermissionDecisions.add(pending);
     const abortFromOperation = (): void => controller.abort();
     signal.addEventListener("abort", abortFromOperation, { once: true });
     if (signal.aborted) controller.abort();
 
-    const timeoutMs = permissions.timeoutMs ?? DEFAULT_PERMISSION_CALLBACK_TIMEOUT_MS;
+    const timeoutMs = permissions.timeoutMs;
     const deadlineAt = performance.now() + timeoutMs;
     let timeoutFired = false;
     const expireIfDeadlinePassed = (): boolean => {
@@ -1095,27 +1440,30 @@ async function createSessionDriver(
       if (controller.signal.aborted) onAbort();
     });
 
-    permissionCallbackBudget.active += 1;
+    if (callbackMode) permissionCallbackBudget.active += 1;
     let workReleased = false;
     const releaseWork = (): void => {
       if (workReleased) return;
       workReleased = true;
       permissionCallbackBudget.active = Math.max(0, permissionCallbackBudget.active - 1);
     };
-    const callbackResult = Promise.resolve().then(() => {
+    const decisionResult = Promise.resolve().then(async () => {
       if (controller.signal.aborted || expireIfDeadlinePassed()) return undefined;
+      if (permissions.mode === "auto") {
+        return { mode: "auto" as const };
+      }
       const projectedContext = permissionContext(request, requestId, operationId, controller.signal, knownSecrets);
       if (controller.signal.aborted || expireIfDeadlinePassed()) return undefined;
-      return permissions.onRequest(projectedContext);
+      return { mode: "callback" as const, decision: await permissions.onRequest(projectedContext) };
     });
-    void callbackResult.then(releaseWork, releaseWork);
-    const observedCallback = callbackResult.then(
+    if (callbackMode) void decisionResult.then(releaseWork, releaseWork);
+    const observedDecision = decisionResult.then(
       (decision) => ({ kind: "decision" as const, decision }),
       () => ({ kind: "error" as const }),
     );
 
     try {
-      const result = await Promise.race([observedCallback, cancelled]);
+      const result = await Promise.race([observedDecision, cancelled]);
       // Timer callbacks cannot run while synchronous user code blocks the
       // event loop. The monotonic deadline is authoritative when its promise
       // eventually resumes, regardless of whether setTimeout has fired.
@@ -1123,12 +1471,22 @@ async function createSessionDriver(
           !permissionRequestIsCurrent(request, turn, signal, operationId)) {
         return permissionResponse(request.options, false, true);
       }
-      const selectedOptionId = result.kind === "decision"
-        ? selectPermission(request, result.decision)
-        : undefined;
-      const response = selectedOptionId === undefined
-        ? permissionResponse(request.options, false)
-        : permissionResponse(request.options, true, false, selectedOptionId);
+      let response: Readonly<Record<string, unknown>>;
+      if (result.kind !== "decision" || result.decision === undefined) {
+        response = permissionResponse(request.options, false);
+      } else if (result.decision.mode === "auto") {
+        const selection = automaticPermissionSelection(request);
+        response = selection
+          ? selectedAllowPermissionResponse(request.options, selection.optionId, selection.kind) ??
+            permissionResponse(request.options, false)
+          : permissionResponse(request.options, false);
+      } else {
+        const selectedOptionId = selectPermission(request, result.decision.decision);
+        response = selectedOptionId === undefined
+          ? permissionResponse(request.options, false)
+          : selectedAllowPermissionResponse(request.options, selectedOptionId, "allow_once") ??
+            permissionResponse(request.options, false);
+      }
       // Recheck after validating the caller's decision. The branded internal
       // response carries this operation/deadline fence to the ACP transport,
       // which revalidates again when the queued response reaches stdin.write.
@@ -1152,14 +1510,14 @@ async function createSessionDriver(
       if (timeout !== undefined) clearTimeout(timeout);
       removeCancelListener();
       signal.removeEventListener("abort", abortFromOperation);
-      pendingPermissionCallbacks.delete(pending);
+      pendingPermissionDecisions.delete(pending);
     }
   };
 
   const close = (): Promise<void> => {
     if (closePromise) return closePromise;
     isClosed = true;
-    abortPermissionCallbacks();
+    abortPermissionDecisions();
     const closedError = new SessionNotFoundError("The ACP session driver is closed.");
     notificationBuffer.close();
     for (const waiter of notificationWaiters) waiter.reject(closedError);
@@ -1225,7 +1583,7 @@ async function createSessionDriver(
     }
     if (!isRecord(notification.params) || !onlyKeys(notification.params, ["sessionId", "update", "_meta"]) ||
         !Object.hasOwn(notification.params, "sessionId") || !Object.hasOwn(notification.params, "update") ||
-        typeof notification.params.sessionId !== "string" || notification.params.sessionId.length === 0 ||
+        !validAcpIdentifier(notification.params.sessionId) ||
         !isRecord(notification.params.update) || typeof notification.params.update.sessionUpdate !== "string") {
       throw new ProtocolFailureError("ACP session update notification is malformed.");
     }
@@ -1233,14 +1591,85 @@ async function createSessionDriver(
     const sessionId = notification.params.sessionId;
     const update = notification.params.update;
     if (Object.hasOwn(update, "_meta")) validateMeta(update._meta, "session/update chunk");
+    const isDiscardedSessionUpdate = update.sessionUpdate === "available_commands_update" ||
+      update.sessionUpdate === "usage_update" || update.sessionUpdate === "plan" ||
+      update.sessionUpdate === "plan_update" || update.sessionUpdate === "plan_removed" ||
+      update.sessionUpdate === "current_mode_update" || update.sessionUpdate === "session_info_update";
+    const discardedUpdateBytes = isDiscardedSessionUpdate ? measureDiscardedSessionUpdate(update) : undefined;
+    const configOptionUpdate = update.sessionUpdate === "config_option_update"
+      ? validateConfigOptionUpdate(update, selectedModelConfigId)
+      : undefined;
     if (remoteSessionId && sessionId !== remoteSessionId) {
       throw new ProtocolFailureError("ACP sent an update for a foreign session.");
     }
-    if (!remoteSessionId) preSessionUpdateIds.add(sessionId);
+    if (!remoteSessionId) {
+      const notificationBytes = serializedNotificationBytes(notification);
+      if (preSessionNotificationCount + 1 > MAX_PRE_SESSION_NOTIFICATION_COUNT ||
+          preSessionNotificationBytes + notificationBytes > MAX_PRE_SESSION_NOTIFICATION_BYTES ||
+          (!preSessionUpdateIds.has(sessionId) && preSessionUpdateIds.size >= MAX_PRE_SESSION_NOTIFICATION_COUNT)) {
+        throw new ProtocolFailureError("ACP startup notifications exceeded their bounded count or byte capacity.");
+      }
+      preSessionNotificationCount += 1;
+      preSessionNotificationBytes += notificationBytes;
+      preSessionUpdateIds.add(sessionId);
+    }
 
     if (activePromptTurn) {
       if (sessionId !== activePromptTurn.sessionId || activePromptTurn.operationId.length === 0) {
         throw new ProtocolFailureError("ACP prompt update does not belong to the current remote session turn.");
+      }
+    }
+
+    if (configOptionUpdate !== undefined) {
+      const selected = configOptionUpdate.selected;
+      if (selectedModelConfigId !== undefined &&
+          (selected?.configId !== selectedModelConfigId || selected.value !== context.configuration.model)) {
+        throw new ProtocolFailureError("ACP changed the model pinned to this session.");
+      }
+      if (selected) {
+        const key = updateKey(sessionId, selected.configId);
+        const recorded = Object.freeze({ sequence: notificationSequence, value: selected.value });
+        modelUpdates.set(key, recorded);
+        for (const waiter of [...notificationWaiters]) {
+          if (waiter.sessionId === sessionId && waiter.configId === selected.configId &&
+              recorded.sequence > waiter.afterSequence) {
+            notificationWaiters.delete(waiter);
+            waiter.resolve(recorded);
+          }
+        }
+      }
+      if (activePromptTurn) {
+        const turn = activePromptTurn;
+        turn.eventCount += 1;
+        if (turn.eventCount > MAX_PROMPT_EVENTS ||
+            turn.outputBytes + turn.activityBytes + configOptionUpdate.bytes > MAX_PROMPT_BYTES) {
+          throw new ProtocolFailureError("ACP configuration updates exceeded their bounded prompt event or byte limit.");
+        }
+        turn.outputBytes += configOptionUpdate.bytes;
+      } else if (remoteSessionId) {
+        idleDiscardedUpdateCount += 1;
+        idleDiscardedUpdateBytes += configOptionUpdate.bytes;
+        if (idleDiscardedUpdateCount > MAX_IDLE_DISCARDED_UPDATE_COUNT ||
+            idleDiscardedUpdateBytes > MAX_IDLE_DISCARDED_UPDATE_BYTES) {
+          throw new ProtocolFailureError("ACP idle session updates exceeded their bounded event or byte limit.");
+        }
+      }
+      notificationBuffer.push(notification);
+      return;
+    }
+
+    if (activePromptTurn) {
+      if (discardedUpdateBytes !== undefined) {
+        const turn = activePromptTurn;
+        turn.eventCount += 1;
+        if (turn.eventCount > MAX_PROMPT_EVENTS ||
+            turn.outputBytes + turn.activityBytes + discardedUpdateBytes > MAX_PROMPT_BYTES) {
+          throw new ProtocolFailureError("ACP prompt housekeeping updates exceeded their bounded event or byte limit.");
+        }
+        // The payload was validated and measured above, but deliberately isn't
+        // retained, surfaced as an event, or treated as response usage.
+        turn.outputBytes += discardedUpdateBytes;
+        return;
       }
       if (activePromptTurn.terminalReceived) {
         const error = new ProtocolFailureError("ACP sent a prompt update after the terminal response.");
@@ -1254,6 +1683,9 @@ async function createSessionDriver(
         // and active prompt turn, but never have caller-tool authority.
         recordAcpActivity(activePromptTurn, update);
         return;
+      }
+      if (update.sessionUpdate === "user_message_chunk") {
+        throw new ProtocolFailureError("ACP user-message chunks cannot be safely mapped to Messages output.");
       }
       if (update.sessionUpdate !== "agent_message_chunk" ||
           !onlyKeys(update, ["sessionUpdate", "content", "messageId", "_meta"]) ||
@@ -1277,26 +1709,20 @@ async function createSessionDriver(
       return;
     }
 
-    if (update.sessionUpdate === "config_option_update") {
-      const selected = modelSelectionFromUpdate(update);
-      if (selected) {
-        if (selectedModelConfigId !== undefined &&
-            (selected.configId !== selectedModelConfigId || selected.value !== context.configuration.model)) {
-          throw new ProtocolFailureError("ACP changed the model pinned to this session.");
-        }
-        const key = updateKey(sessionId, selected.configId);
-        const recorded = Object.freeze({ sequence: notificationSequence, value: selected.value });
-        modelUpdates.set(key, recorded);
-        for (const waiter of [...notificationWaiters]) {
-          if (waiter.sessionId === sessionId && waiter.configId === selected.configId &&
-              recorded.sequence > waiter.afterSequence) {
-            notificationWaiters.delete(waiter);
-            waiter.resolve(recorded);
-          }
+    if (discardedUpdateBytes !== undefined) {
+      if (remoteSessionId) {
+        idleDiscardedUpdateCount += 1;
+        idleDiscardedUpdateBytes += discardedUpdateBytes;
+        if (idleDiscardedUpdateCount > MAX_IDLE_DISCARDED_UPDATE_COUNT ||
+            idleDiscardedUpdateBytes > MAX_IDLE_DISCARDED_UPDATE_BYTES) {
+          throw new ProtocolFailureError("ACP idle session housekeeping exceeded its bounded event or byte limit.");
         }
       }
-      notificationBuffer.push(notification);
       return;
+    }
+
+    if (update.sessionUpdate === "user_message_chunk") {
+      throw new ProtocolFailureError("ACP user-message chunks cannot be safely mapped to Messages output.");
     }
     throw new ProtocolFailureError("ACP sent a session update without a current prompt owner.");
   };
@@ -1320,7 +1746,7 @@ async function createSessionDriver(
       onFailure: (error) => {
         notificationBuffer.close(error);
         if (activePromptTurn) {
-          abortPermissionCallbacks(activePromptTurn);
+          abortPermissionDecisions(activePromptTurn);
           activePromptTurn.protocolFailure ??= error;
           activePromptTurn.events.close(error);
           const turn = activePromptTurn;
@@ -1554,7 +1980,7 @@ async function createSessionDriver(
       // A permission decision belongs only to the operation that created its
       // immutable context. Starting the next continuation revokes any pending
       // decisions from the parked operation before changing ownership.
-      abortPermissionCallbacks(turn);
+      abortPermissionDecisions(turn);
       // This is the driver-side state transition that must precede any MCP
       // result release. ACP output can now arrive and remain buffered while
       // the session engine waits for the loopback response finish event.
@@ -1615,7 +2041,7 @@ async function createSessionDriver(
         prompt: operation.acpPrompt as readonly AcpTextBlock[],
       }, {
         onResponse: () => {
-          abortPermissionCallbacks(turn);
+          abortPermissionDecisions(turn);
           turn.terminalReceived = true;
           if (turn.awaitingContinuation && !turn.continuationPrepared) {
             const error = new ProtocolFailureError("ACP completed a prompt while caller MCP results were still parked.");
@@ -1629,12 +2055,12 @@ async function createSessionDriver(
           turn.events.close();
         },
       }).then((response) => {
-        abortPermissionCallbacks(turn);
+        abortPermissionDecisions(turn);
         turn.terminalReceived = true;
         turn.events.close();
         return response;
       }, (error: unknown) => {
-        abortPermissionCallbacks(turn);
+        abortPermissionDecisions(turn);
         if (error instanceof RequestTimeoutError) turn.requestTimedOut = true;
         const failure = error instanceof Error ? error : new ProcessFailureError("ACP prompt failed.");
         turn.events.close(failure);
@@ -1648,7 +2074,7 @@ async function createSessionDriver(
 
       turn.cleanup = (): Promise<void> => {
         if (turn.cleanupPromise) return turn.cleanupPromise;
-        abortPermissionCallbacks(turn);
+        abortPermissionDecisions(turn);
         const cleaning = (async () => {
           turn.initialAbortCleanup?.();
           const currentConnection = connection;
@@ -1801,7 +2227,7 @@ async function createSessionDriver(
           mcpServers,
           _meta: { agy: { enabledTools: [] } },
         });
-        if (!isRecord(created) || typeof created.sessionId !== "string" || created.sessionId.length === 0) {
+        if (!isRecord(created) || !validAcpIdentifier(created.sessionId)) {
           throw new ProtocolFailureError("ACP session/new returned an invalid session identifier.");
         }
         remoteSessionId = created.sessionId;
@@ -1953,30 +2379,6 @@ function modelOptions(selector: { readonly options: readonly unknown[] }): reado
     values.push(option.value);
   }
   return values;
-}
-
-/** ACP v1 config_option_update carries full configOptions, not configId/value. */
-function modelSelectionFromUpdate(
-  update: Record<string, unknown>,
-): { readonly configId: string; readonly value: string } | undefined {
-  if (!Array.isArray(update.configOptions)) {
-    throw new ProtocolFailureError("ACP model configuration update has no configOptions list.");
-  }
-  const candidates: Record<string, unknown>[] = [];
-  for (const option of update.configOptions) {
-    if (!isRecord(option)) throw new ProtocolFailureError("ACP model configuration update contains a malformed option.");
-    if (option.category === "model" || option.id === "model") candidates.push(option);
-  }
-  if (candidates.length === 0) return undefined;
-  if (candidates.length !== 1) {
-    throw new ProtocolFailureError("ACP model configuration update is ambiguous.");
-  }
-  const [selector] = candidates;
-  if (!selector || typeof selector.id !== "string" || selector.id.length === 0 ||
-      typeof selector.currentValue !== "string") {
-    throw new ProtocolFailureError("ACP model configuration update has no verifiable selected value.");
-  }
-  return Object.freeze({ configId: selector.id, value: selector.currentValue });
 }
 
 function selectedModelFrom(response: unknown, configId: string): string | undefined {

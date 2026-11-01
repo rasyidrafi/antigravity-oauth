@@ -17,6 +17,7 @@ import {
   UnsupportedFeatureError,
   createProfileRegistry,
 } from "../dist/index.js";
+import { normalizeAcpPermissionPolicy } from "../dist/acp-permissions.js";
 
 const deferred = () => {
   let resolve;
@@ -220,19 +221,45 @@ test("SDK rejects malformed policy/permission options and callback bypass throug
     { onRequest: handler, timeoutMs: 60_001 },
     { onRequest: handler, timeoutMs: 1.5 },
     { onRequest: handler, extra: true },
+    { mode: "unexpected" },
+    { mode: "auto", onRequest: handler },
+    { mode: "deny", onRequest: undefined },
+    { onRequest: handler, mode: undefined },
+    { mode: "auto", timeoutMs: 0 },
   ]) {
     assert.throws(() => new AntigravitySDK({ ...base, permissions }), InvalidRequestError);
   }
 
+  let accessorCalled = false;
+  const accessorPermissions = Object.defineProperty({}, "mode", {
+    enumerable: true,
+    get() {
+      accessorCalled = true;
+      return "auto";
+    },
+  });
+  assert.throws(() => new AntigravitySDK({ ...base, permissions: accessorPermissions }), InvalidRequestError);
+  assert.equal(accessorCalled, false, "permission accessors are rejected without execution");
+  const symbolPermissions = { mode: "auto", [Symbol("unexpected")]: true };
+  assert.throws(() => new AntigravitySDK({ ...base, permissions: symbolPermissions }), InvalidRequestError);
+  const nonEnumerablePermissions = Object.defineProperty({}, "mode", { value: "auto" });
+  assert.throws(() => new AntigravitySDK({ ...base, permissions: nonEnumerablePermissions }), InvalidRequestError);
+
   let callbackCalls = 0;
-  assert.throws(
-    () => new AntigravitySDK({
-      ...base,
-      permissions: { onRequest: () => { callbackCalls += 1; } },
-      sessionDriverFactory: () => { throw new Error("not called during construction"); },
-    }),
-    InvalidRequestError,
-  );
+  for (const permissions of [
+    { mode: "auto" },
+    { mode: "deny" },
+    { onRequest: () => { callbackCalls += 1; } },
+  ]) {
+    assert.throws(
+      () => new AntigravitySDK({
+        ...base,
+        permissions,
+        sessionDriverFactory: () => { throw new Error("not called during construction"); },
+      }),
+      InvalidRequestError,
+    );
+  }
   assert.equal(callbackCalls, 0);
 
   const permissions = { onRequest: () => { callbackCalls += 1; }, timeoutMs: 25 };
@@ -241,6 +268,30 @@ test("SDK rejects malformed policy/permission options and callback bypass throug
   permissions.timeoutMs = 60_000;
   await sdk.close();
   assert.equal(callbackCalls, 0, "construction and close do not execute caller callbacks");
+});
+
+test("permission policy normalization defaults to frozen auto and isolates caller mutations", () => {
+  const defaultPolicy = normalizeAcpPermissionPolicy(undefined);
+  assert.deepEqual(defaultPolicy, { mode: "auto", timeoutMs: 10_000 });
+  assert.equal(Object.isFrozen(defaultPolicy), true);
+
+  const denyOptions = { mode: "deny", timeoutMs: 25 };
+  const denyPolicy = normalizeAcpPermissionPolicy(denyOptions);
+  denyOptions.mode = "auto";
+  denyOptions.timeoutMs = 50;
+  assert.deepEqual(denyPolicy, { mode: "deny", timeoutMs: 25 });
+  assert.equal(Object.isFrozen(denyPolicy), true);
+
+  const firstHandler = () => ({ action: "deny" });
+  const secondHandler = () => ({ action: "select", optionId: "later" });
+  const callbackOptions = { onRequest: firstHandler, timeoutMs: 100 };
+  const callbackPolicy = normalizeAcpPermissionPolicy(callbackOptions);
+  callbackOptions.onRequest = secondHandler;
+  callbackOptions.timeoutMs = 500;
+  assert.equal(callbackPolicy.mode, "callback");
+  assert.equal(callbackPolicy.onRequest, firstHandler);
+  assert.equal(callbackPolicy.timeoutMs, 100);
+  assert.equal(Object.isFrozen(callbackPolicy), true);
 });
 
 test("A1 compatibility policy does not bypass an injected worker's hard-bound admission gate", async () => {

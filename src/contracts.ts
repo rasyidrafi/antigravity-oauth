@@ -105,22 +105,60 @@ export type AcpPermissionHandler = (
 ) => AcpPermissionDecision | Promise<AcpPermissionDecision>;
 
 /**
- * Permission callback options. The SDK default is no callback and denial.
+ * Built-in ACP permission policy. Omitting this option selects `mode: "auto"`:
+ * the driver automatically chooses the first offered `allow_always`, falling
+ * back to the first offered `allow_once`; it does not invoke a caller callback
+ * or ask this SDK's caller for approval. `mode: "deny"` explicitly denies.
+ * The callback form preserves the existing opt-in one-shot decision API.
+ *
+ * ACP origin is unverified. Automatic approval can authorize arbitrary
+ * agent-side effects; `allow_always` may persist beyond this SDK or session,
+ * and cancellation cannot retract approval bytes already written or grants
+ * already persisted by the ACP agent. This SDK cannot revoke a prior written
+ * approval or ACP-side persistent grant; `mode: "deny"` affects subsequent
+ * requests only. The ACP agent may have its own prompting or persistence
+ * behavior, which this option does not control.
+ *
+ * This option configures only the built-in ACP driver. A custom
+ * `sessionDriverFactory` owns its permission policy; explicitly combining a
+ * custom driver with this option is rejected.
+ *
  * The timeout defaults to 10 seconds and is bounded to 1–60,000 ms. A timeout
- * aborts the callback signal and cancels the ACP decision; a monotonic elapsed
- * deadline is checked after callback execution and again at the final outbound
- * permission write boundary, even if the timer was delayed. The owning
- * operation, terminal state, and driver ownership are revalidated while the
- * response is serialized immediately before `stdin.write()`. Once that write
- * accepts the frame, later cancellation cannot retract bytes already buffered
- * by the transport. Callback decisions are never assumed to prove request
- * origin. Handlers must not block the JavaScript thread; synchronous code
- * cannot be preempted.
+ * cancels the ACP decision and, in callback mode, aborts the callback signal.
+ * A monotonic elapsed deadline is checked after callback execution (when
+ * applicable) and again at the final outbound permission write boundary, even
+ * if the timer was delayed. The owning operation, terminal state, and driver
+ * ownership are revalidated while the response is serialized immediately
+ * before `stdin.write()`. Once that write accepts the frame, later
+ * cancellation cannot retract bytes already buffered by the transport.
+ * Callback decisions are never assumed to prove request origin. Handlers must
+ * not block the JavaScript thread; synchronous code cannot be preempted.
  */
-export interface AcpPermissionsOptions {
-  readonly onRequest: AcpPermissionHandler;
-  readonly timeoutMs?: number;
-}
+export type AcpPermissionsOptions =
+  | {
+      /** Automatically choose the first offered allow_always, else allow_once. */
+      readonly mode: "auto";
+      readonly timeoutMs?: number;
+      readonly onRequest?: never;
+    }
+  | {
+      /** Explicitly reject permission requests. */
+      readonly mode: "deny";
+      readonly timeoutMs?: number;
+      readonly onRequest?: never;
+    }
+  | {
+      /** Caller-managed callback; it can select only an exact offered allow_once. */
+      readonly mode?: never;
+      readonly onRequest: AcpPermissionHandler;
+      readonly timeoutMs?: number;
+    };
+
+/** Frozen SDK-internal normalization; not part of the package-root API. */
+export type AcpPermissionPolicy =
+  | { readonly mode: "auto"; readonly timeoutMs: number }
+  | { readonly mode: "deny"; readonly timeoutMs: number }
+  | { readonly mode: "callback"; readonly onRequest: AcpPermissionHandler; readonly timeoutMs: number };
 
 /** The two truthful outcomes reported for a requested output-token bound. */
 export type MaxTokensEnforcementOutcome =
