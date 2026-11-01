@@ -1,0 +1,50 @@
+{
+  "name": "antigravity-oauth-sdk",
+  "version": "0.1.0",
+  "description": "Explicit-account Anthropic Messages normalization and session ledger for Antigravity ACP.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./chat": {
+      "types": "./dist/chat.d.ts",
+      "import": "./dist/chat.js"
+    },
+    "./responses": {
+      "types": "./dist/responses.d.ts",
+      "import": "./dist/responses.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.type-tests.json",
+    "test": "npm run build && npm run typecheck && node --test test/*.test.mjs",
+    "test:packed": "npm run build && node test/packed-consumer-smoke.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "ajv": "^8.20.0"
+  },
+  "peerDependencies": {
+    "@zenmux/rosetta-ai": "1.0.38"
+  },
+  "peerDependenciesMeta": {
+    "@zenmux/rosetta-ai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@zenmux/rosetta-ai": "1.0.38",
+    "typescript": "^5.9.3"
+  }
+}
