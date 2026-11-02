@@ -75,15 +75,22 @@ async function makeFixture(root, {
           async admitResponse(request) {
             admissions.push(request);
             const result = await onAdmission?.(request, admissions.length);
+            const outcome = request.maxTokens === undefined
+              ? "unbounded"
+              : capabilities.maxTokens === "enforced" ? "enforced" : "ignored";
             return result ?? {
               kind: request.kind,
               operationId: request.operationId,
               accountId: request.accountId,
               sessionId: request.sessionId,
-              maxTokens: request.maxTokens,
+              ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
               policy: request.policy,
-              outcome: "enforced",
-              reason: "driver-admitted-requested-bound",
+              outcome,
+              reason: outcome === "enforced"
+                ? "driver-admitted-requested-bound"
+                : outcome === "ignored"
+                  ? "backend-does-not-enforce-requested-bound"
+                  : "no-output-token-bound-requested",
             };
           },
         } : {}),
@@ -243,24 +250,31 @@ test("Anthropic stop reasons map only from explicit supported ACP terminal resul
   });
 });
 
-test("required max_tokens is never ignored: capability absence rejects before dispatch", async () => {
+test("missing and unenforced max_tokens are admitted without synthesizing an output bound", async () => {
   await withTempDirectory(async (root) => {
     const fixture = await makeFixture(root, { capabilities: {} });
     try {
-      await assert.rejects(
-        fixture.session.messages.create(messageRequest([user("must be bounded")])),
-        UnsupportedFeatureError,
-      );
-      assert.equal(fixture.operations.length, 0);
-      assert.equal(fixture.session.state, "idle");
-      await assert.rejects(
-        fixture.session.executeMessage(
-          { transcript: [user("direct ledger path")] },
-          { maxTokens: 64 },
-        ),
-        UnsupportedFeatureError,
-      );
-      assert.equal(fixture.operations.length, 0);
+      const unbounded = await fixture.session.messages.create({ messages: [user("no bound supplied")] });
+      assert.equal(unbounded.content[0].text, "answer");
+      assert.equal(Object.hasOwn(fixture.operations[0], "maxTokens"), false);
+      assert.equal(Object.hasOwn(fixture.admissions[0], "maxTokens"), false);
+      assert.deepEqual((await fixture.session.diagnostics.snapshot()).maxTokensEnforcement, {
+        accountId: fixture.session.accountId,
+        sessionId: fixture.session.sessionId,
+        operationId: fixture.operations[0].operationId,
+        kind: "prompt",
+        policy: "strict",
+        outcome: "unbounded",
+        reason: "no-output-token-bound-requested",
+      });
+
+      const supplied = await fixture.session.messages.create({
+        max_tokens: 17,
+        messages: [...fixture.session.snapshot().transcript, user("bound is ignored")],
+      });
+      assert.equal(supplied.content[0].text, "answer");
+      assert.equal(fixture.operations[1].maxTokens, 17);
+      assert.equal((await fixture.session.diagnostics.snapshot()).maxTokensEnforcement.outcome, "ignored");
     } finally {
       await closeFixture(fixture);
     }
@@ -352,7 +366,7 @@ test("maxTokens capability alone cannot admit a response, and admission failures
   });
 });
 
-test("strict session policy rejects injected or forged not-enforced admissions before dispatch", async () => {
+test("strict legacy policy admits ignored bounds but rejects forged admission outcomes", async () => {
   await withTempDirectory(async (root) => {
     let admissionCalls = 0;
     const fixture = await makeFixture(root, {
@@ -364,23 +378,21 @@ test("strict session policy rejects injected or forged not-enforced admissions b
           operationId: request.operationId,
           accountId: request.accountId,
           sessionId: request.sessionId,
-          maxTokens: request.maxTokens,
+          ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
           policy: request.policy,
-          outcome: "not-enforced",
+          outcome: "ignored",
           reason: "backend-does-not-enforce-requested-bound",
         };
       },
     });
     try {
       assert.equal(fixture.contexts[0].maxTokensPolicy, "strict");
-      assert.equal(fixture.session.capabilities.maxTokens, undefined,
-        "an injected non-enforcing declaration cannot weaken the strict SDK policy");
-      await assert.rejects(
-        fixture.session.messages.create(messageRequest([user("not permitted")], 13)),
-        UnsupportedFeatureError,
-      );
-      assert.equal(admissionCalls, 0);
-      assert.equal(fixture.operations.length, 0);
+      assert.equal(fixture.session.capabilities.maxTokens, "not-enforced");
+      const response = await fixture.session.messages.create(messageRequest([user("unbounded is allowed")], 13));
+      assert.equal(response.content[0].text, "answer");
+      assert.equal(messageMaxTokensEnforcement(response).outcome, "ignored");
+      assert.equal(admissionCalls, 1);
+      assert.equal(fixture.operations.length, 1);
       assert.equal(fixture.session.state, "idle");
     } finally {
       await closeFixture(fixture);
@@ -395,9 +407,9 @@ test("strict session policy rejects injected or forged not-enforced admissions b
         operationId: request.operationId,
         accountId: request.accountId,
         sessionId: request.sessionId,
-        maxTokens: request.maxTokens,
+        ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
         policy: request.policy,
-        outcome: "not-enforced",
+        outcome: "ignored",
         reason: "backend-does-not-enforce-requested-bound",
       }),
     });
@@ -548,7 +560,8 @@ test("unsupported request fields, roles, blocks, pinned tools, and system format
       for (const request of unsupportedRequests) {
         await assert.rejects(fixture.session.messages.create(request), UnsupportedFeatureError);
       }
-      await assert.rejects(fixture.session.messages.create({ messages: base }), InvalidRequestError, "max_tokens remains required");
+      const unbounded = await fixture.session.messages.create({ messages: base });
+      assert.equal(messageMaxTokensEnforcement(unbounded).outcome, "unbounded");
       await assert.rejects(fixture.session.messages.create(messageRequest([])), InvalidRequestError);
       await assert.rejects(fixture.session.messages.create(messageRequest([user("x")], 0)), InvalidRequestError);
       await assert.rejects(fixture.session.messages.create({ ...messageRequest(base), stream: 0 }), InvalidRequestError);
@@ -566,7 +579,7 @@ test("unsupported request fields, roles, blocks, pinned tools, and system format
       });
       await assert.rejects(fixture.session.messages.create(accessorStreamRequest), InvalidRequestError);
       assert.equal(streamGetterRan, false);
-      assert.equal(fixture.operations.length, 0);
+      assert.equal(fixture.operations.length, 1, "the valid omitted-bound request is dispatched");
       assert.equal(fixture.session.state, "idle");
     } finally {
       await closeFixture(fixture);
@@ -864,6 +877,49 @@ test("prompt helper preserves roles and system tagging without passing committed
   ]);
 });
 
+test("native Messages streams preserve an omitted output bound as unbounded", async () => {
+  await withTempDirectory(async (root) => {
+    const fixture = await makeFixture(root, {
+      capabilities: { maxTokens: "enforced", streaming: "incremental" },
+      async *onStream() {
+        yield { type: "text", text: "unbounded stream" };
+        yield {
+          type: "complete",
+          acknowledgement: {
+            stage: "completed",
+            output: [assistant("unbounded stream")],
+            result: { stopReason: "end_turn" },
+          },
+        };
+      },
+    });
+    try {
+      const stream = await fixture.session.messages.create({
+        messages: [user("no output bound")],
+        stream: true,
+      });
+      const events = [];
+      for await (const event of stream) events.push(event);
+      const start = events.find(({ type }) => type === "message_start");
+      assert.ok(start);
+      assert.deepEqual(messageMaxTokensEnforcement(start.message), {
+        accountId: fixture.session.accountId,
+        sessionId: fixture.session.sessionId,
+        operationId: fixture.streams[0].operationId,
+        kind: "prompt",
+        policy: "strict",
+        outcome: "unbounded",
+        reason: "no-output-token-bound-requested",
+      });
+      assert.equal(Object.hasOwn(fixture.streams[0], "maxTokens"), false);
+      assert.equal(Object.hasOwn(fixture.admissions[0], "maxTokens"), false);
+      assert.equal(events.at(-1).type, "message_stop");
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+});
+
 test("incremental Messages streams preserve text, event order, usage, and nonstream parity", async () => {
   await withTempDirectory(async (root) => {
     const answerText = "  hé🙂llo\n  ";
@@ -1019,7 +1075,7 @@ test("response-scoped enforcement receipts stay immutable across responses, sess
       assert.equal(messageUsageProvenance(responseB).inputTokens, 3);
       assert.equal(messageUsageProvenance({}), undefined);
 
-      responseA.max_tokens_enforcement = { outcome: "not-enforced" };
+      responseA.max_tokens_enforcement = { outcome: "ignored" };
       assert.deepEqual(messageMaxTokensEnforcement(responseA), receiptA,
         "mutating an Anthropic payload cannot mutate its out-of-band receipt");
       assert.equal(Object.isFrozen(messageMaxTokensEnforcement(responseA)), true);

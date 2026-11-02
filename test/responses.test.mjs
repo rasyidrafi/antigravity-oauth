@@ -90,12 +90,16 @@ async function makeFixture(root, {
             operationId: request.operationId,
             accountId: request.accountId,
             sessionId: request.sessionId,
-            maxTokens: request.maxTokens,
+            ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
             policy: request.policy,
-            outcome: effectiveCapabilities.maxTokens === "not-enforced" ? "not-enforced" : "enforced",
-            reason: effectiveCapabilities.maxTokens === "not-enforced"
-              ? "backend-does-not-enforce-requested-bound"
-              : "driver-admitted-requested-bound",
+            outcome: request.maxTokens === undefined
+              ? "unbounded"
+              : effectiveCapabilities.maxTokens === "not-enforced" ? "ignored" : "enforced",
+            reason: request.maxTokens === undefined
+              ? "no-output-token-bound-requested"
+              : effectiveCapabilities.maxTokens === "not-enforced"
+                ? "backend-does-not-enforce-requested-bound"
+                : "driver-admitted-requested-bound",
           };
         },
         async dispatch(operation) {
@@ -475,7 +479,7 @@ test("non-streaming adapter pins model/system/tools and reports cache-inclusive 
   });
 });
 
-test("opt-in Responses metadata tracks Rosetta's normalized bound without enforcing or truncating it", async () => {
+test("Responses ignores Rosetta defaults and reports only caller-supplied output bounds", async () => {
   await withTempDirectory(async (root) => {
     let turn = 0;
     const answer = "This long Responses answer intentionally overshoots a one-token requested output bound.";
@@ -497,7 +501,8 @@ test("opt-in Responses metadata tracks Rosetta's normalized bound without enforc
         model: "model-compat-responses",
         input: "default limit",
       });
-      assert.equal(fixture.operations[0].maxTokens, 4096, "Rosetta's omitted/null default is admitted as 4096");
+      assert.equal(Object.hasOwn(fixture.operations[0], "maxTokens"), false,
+        "Rosetta's converted 4096 default is not forwarded as caller intent");
       assert.equal(first.output[0].content[0].text, answer);
       const firstDisclosure = first.max_tokens_enforcement;
       assert.deepEqual(firstDisclosure, {
@@ -505,10 +510,9 @@ test("opt-in Responses metadata tracks Rosetta's normalized bound without enforc
         sessionId: fixture.session.sessionId,
         operationId: fixture.operations[0].operationId,
         kind: "prompt",
-        requestedMaxTokens: 4096,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
-        reason: "backend-does-not-enforce-requested-bound",
+        outcome: "unbounded",
+        reason: "no-output-token-bound-requested",
       });
       assert.equal(Object.isFrozen(firstDisclosure), true);
 
@@ -525,7 +529,7 @@ test("opt-in Responses metadata tracks Rosetta's normalized bound without enforc
       assert.equal(second.output[0].content[0].text, answer, "the compatibility path does not impose a local output cap");
       assert.equal(second.usage.output_tokens, 91);
       assert.equal(second.max_tokens_enforcement.requestedMaxTokens, 1);
-      assert.equal(second.max_tokens_enforcement.outcome, "not-enforced");
+      assert.equal(second.max_tokens_enforcement.outcome, "ignored");
       assert.equal(Object.isFrozen(second.max_tokens_enforcement), true);
       assert.deepEqual(first.max_tokens_enforcement, firstDisclosure,
         "a later Responses operation cannot replace the earlier response-scoped receipt");
@@ -539,11 +543,12 @@ test("opt-in Responses metadata tracks Rosetta's normalized bound without enforc
       capabilities: { maxTokens: "not-enforced" },
     });
     try {
-      await assert.rejects(strict.responses.responses.create({
+      const response = await strict.responses.responses.create({
         model: "model-strict-not-enforced-responses",
-        input: "must fail closed",
-      }), UnsupportedFeatureError);
-      assert.equal(strict.operations.length, 0);
+        input: "legacy strict does not block ACP",
+      });
+      assert.equal(response.max_tokens_enforcement.outcome, "unbounded");
+      assert.equal(strict.operations.length, 1);
     } finally {
       await strict.close();
     }
@@ -631,7 +636,7 @@ test("full Responses transcript continues an actual receipt-backed caller-tool h
       assert.equal(first.status, "completed");
       assert.equal(first.max_tokens_enforcement.kind, "prompt");
       assert.equal(first.max_tokens_enforcement.requestedMaxTokens, 21);
-      assert.equal(first.max_tokens_enforcement.outcome, "not-enforced");
+      assert.equal(first.max_tokens_enforcement.outcome, "ignored");
       const call = first.output.find((item) => item.type === "function_call");
       assert.ok(call);
       expectedCallId = call.call_id;
@@ -644,7 +649,6 @@ test("full Responses transcript continues an actual receipt-backed caller-tool h
           ...first.output,
           { type: "function_call_output", call_id: call.call_id, output: "tool-result-alpha" },
         ],
-        max_output_tokens: 7,
       });
       assert.equal(final.output[0].content[0].text, "tool finished");
       assert.deepEqual(final.max_tokens_enforcement, {
@@ -652,11 +656,11 @@ test("full Responses transcript continues an actual receipt-backed caller-tool h
         sessionId: fixture.session.sessionId,
         operationId: fixture.continuations[0].operationId,
         kind: "tool_continuation",
-        requestedMaxTokens: 7,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
-        reason: "backend-does-not-enforce-requested-bound",
+        outcome: "unbounded",
+        reason: "no-output-token-bound-requested",
       });
+      assert.equal(Object.hasOwn(fixture.continuations[0], "maxTokens"), false);
       assert.equal(fixture.operations.length, 1);
       assert.equal(fixture.continuations.length, 1);
       const continuationText = fixture.continuations[0].messages;
@@ -807,7 +811,7 @@ test("adapter streams preserve fan-out ordering, terminal state, usage provenanc
         await noUsage.close();
       }
 
-      assert.equal(fixture.streams[0].maxTokens, 4096);
+      assert.equal(Object.hasOwn(fixture.streams[0], "maxTokens"), false);
     } finally {
       await fixture.close();
     }
@@ -868,7 +872,7 @@ test("opt-in Responses stream discloses its bound in initial fan-out events and 
         kind: "prompt",
         requestedMaxTokens: 2,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
+        outcome: "ignored",
         reason: "backend-does-not-enforce-requested-bound",
       });
       assert.deepEqual(created.value.response.max_tokens_enforcement, disclosure,
@@ -935,7 +939,7 @@ test("unknown or partial usage is not converted into false zero/cache-inclusive 
         kind: "unknown",
         reason: "The ACP driver did not report complete per-operation token usage.",
       });
-      assert.equal(fixture.operations[0].maxTokens, 4096);
+      assert.equal(Object.hasOwn(fixture.operations[0], "maxTokens"), false);
     } finally {
       await fixture.close();
     }

@@ -29,7 +29,7 @@ const enforcement: ChatCompletionResponse["max_tokens_enforcement"] = {
   kind: "prompt",
   requestedMaxTokens: 1,
   policy: "allow-unenforced-max-tokens",
-  outcome: "not-enforced",
+  outcome: "ignored",
   reason: "backend-does-not-enforce-requested-bound",
 };
 void nonStreaming;

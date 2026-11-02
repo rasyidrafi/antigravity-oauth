@@ -4,12 +4,11 @@ An early TypeScript/ESM SDK implementation for Anthropic Messages over
 Antigravity ACP. It exports the `AntigravitySDK` composition root, opt-in ACP
 v1 stdio transport, explicit profile-bound authentication, an account-bound
 session ledger, and an S6 text-only native Messages facade. The built-in driver
-starts a reviewed ACP session and verifies the requested model. Strict mode
-still refuses inference without a verified output-token bound; the explicit
-compatibility mode can use the prompt/event pump but does not enforce
-`max_tokens`. Optional Rosetta adapters disclose the exact normalized limit
-and its enforcement outcome out of band; the compatibility path can exceed
-the requested bound. Scoped live smoke tests have exercised explicit login in
+starts a reviewed ACP session, disables Antigravity built-in tools, registers
+only the session's client-defined MCP tools, and verifies the requested model.
+Official ACP inference does not enforce `max_tokens`: supplied values are
+reported as ignored and omitted values as unbounded. No adapter default is
+invented as caller intent. Scoped live smoke tests have exercised explicit login in
 two SDK-owned profiles, native text inference and streaming, caller-managed
 tool handoffs across those profiles, and streaming and non-streaming Rosetta
 requests; see [Scoped live verification](#scoped-live-verification). These
@@ -21,11 +20,12 @@ per-account OAuth or keychain isolation.
 
 > **Dangerous permission default:** For the built-in ACP driver, omitting
 > `permissions` selects automatic approval: on a valid request owned by the
-> active ACP turn it chooses the first offered `allow_always`, or the first
-> offered `allow_once` if no `allow_always` is available. This does not ask the
+> active ACP turn it chooses the first offered `allow_once` and denies when
+> one is unavailable. It never selects `allow_always`. This does not ask the
 > application for a callback or human decision. ACP request origin is
-> unverified, and approval can authorize arbitrary agent-side effects. An
-> `allow_always` grant may outlive this SDK/session. The SDK cannot revoke
+> unverified, and approval can authorize arbitrary agent-side effects. Although
+> this policy never selects `allow_always`, persistent ACP grants may outlive
+> this SDK/session. The SDK cannot revoke
 > approval bytes already written or grants already persisted by the ACP agent.
 > This setting does not control any prompting or persistence implemented by
 > the ACP agent.
@@ -91,9 +91,8 @@ when an account operation runs. Login is never automatic:
 ```ts
 import { AntigravitySDK, messageMaxTokensEnforcement } from "antigravity-oauth-sdk";
 
-// maxTokensPolicy is strict when omitted. The built-in ACP driver rejects a
-// Messages prompt unless a hard output-token bound has been established.
-// Permission omission instead means automatic approval; this example opts out.
+// maxTokensPolicy is a legacy option and does not block ACP inference.
+// Permission omission means one-shot automatic approval; this example opts out.
 const strictSdk = new AntigravitySDK({
   storageDir,
   executable,
@@ -124,8 +123,8 @@ const session = await account.sessions.create({
   }],
 });
 await session.tools.createMcpServer();
-// This explicit compatibility option does not make ACP enforce max_tokens;
-// the response may exceed the requested bound, spend, and quota.
+// ACP ignores this caller-supplied max_tokens value. The answer may exceed it,
+// increasing output, spend, and quota; the SDK does not truncate the answer.
 const message = await session.messages.create({
   max_tokens: 512,
   messages: [{ role: "user", content: "Hello" }],
@@ -133,7 +132,7 @@ const message = await session.messages.create({
 // This immutable receipt belongs to this exact response (unlike the latest
 // operation in the session diagnostics snapshot).
 const admission = messageMaxTokensEnforcement(message);
-if (admission?.outcome === "not-enforced") {
+if (admission?.outcome === "ignored") {
   console.warn(
     `ACP did not enforce max_tokens=${admission.requestedMaxTokens}; output, spend, and quota may exceed expectations.`,
   );
@@ -154,6 +153,22 @@ blocker, issues ACP v1 `initialize`, then creates a session and selects the
 requested model. By default, the SDK does not read or copy ambient environment
 variables; callers may explicitly provide the allow-listed safe environment
 source.
+
+Account metadata is available through `account.identity.get()` and
+`account.quota.summary()`. Identity includes only the verified provider ID and
+email. These calls refresh the selected profile's OAuth credentials, use fixed
+Google HTTPS endpoints, reject redirects, and keep tokens out of returned
+values. Quota is a bounded projection of Google's internal
+`retrieveUserQuotaSummary` response; that endpoint and its schema are not a
+stable public API. `account.models.list({ cwd })` starts a temporary reviewed
+ACP process and reads only the model selector advertised by `session/new` with
+`_meta.agy.enabledTools: []`; it does not run inference or call an internal
+model-discovery HTTP endpoint. Supply the working directory that should be
+associated with this ACP discovery session. If OAuth returns a different
+refresh token, identity/quota requests fail closed rather than rewrite the ACP
+credential file; use `auth.login()` to refresh the local auth state. SDK
+login/logout share the profile lock with these requests, but independent ACP
+processes do not participate in that lock.
 
 The built-in driver accepts only the reviewed Antigravity ACP 1.3.0
 executable/companion hash pairs for Linux x64, Windows x64, and macOS ARM64.
@@ -188,11 +203,10 @@ startup fails closed.
 
 The built-in driver now owns one ACP `session/prompt` pump and can park that
 same prompt while authenticated session MCP calls wait for caller-managed
-results. Under strict policy (the default) the official driver still refuses
-admission before prompt dispatch or tool-result release because ACP does not
-establish a per-response output-token bound. The explicit compatibility policy
-below uses the same ACP prompt/event pump without claiming that `max_tokens` is
-enforced.
+results. Official ACP inference proceeds without a hard per-response
+output-token bound; supplied values are ignored, while omissions remain
+unbounded. Operation-bound admission still precedes prompt dispatch and any
+tool-result release.
 
 In-memory ACP and loopback MCP fixtures exercise the public SDK's built-in
 caller-tool handoff and result continuation without external account
@@ -205,10 +219,11 @@ broader tool, model, account, or platform interoperability.
 > **Permission safety notice:** The built-in default is automatic approval,
 > not an application callback or human approval step. For a valid permission
 > request owned by the active ACP turn, the SDK selects the first offered
-> `allow_always`, falling back to the
-> first offered `allow_once`. ACP origin is unverified; the request is not
+> `allow_once` and denies when none is available; it never selects
+> `allow_always`. ACP origin is unverified; the request is not
 > proven to come from this SDK's MCP server. Approval can authorize arbitrary
-> agent-side effects, and `allow_always` may persist beyond the SDK or session.
+> agent-side effects. Persistent ACP grants may outlive this SDK/session, but
+> this SDK's automatic policy does not request them.
 > Cancellation cannot retract approval bytes already written or grants already
 > persisted by the ACP agent. The SDK has no API to revoke a previously written
 > approval or an ACP-side persistent grant; `mode: "deny"` rejects subsequent
@@ -271,33 +286,32 @@ support guarantees:
   `gemini-3.8-flash-medium`, and `gemini-3.8-flash-high`; this does not
   guarantee their availability for other accounts or at other times.
 - Through the public SDK, a native non-streaming Messages request returned
-  expected text with a `not-enforced` output-token receipt. A separate session
+  expected text with an `ignored` output-token receipt. A separate session
   completed a non-streaming first turn and then a streaming second turn using
   the full history; the second response returned the expected remembered text
-  and its stream-start receipt was also `not-enforced`. The default strict
-  policy rejected a request before dispatch. No test established a hard
+  and its stream-start receipt was also `ignored`. No test established a hard
   `max_tokens` limit.
 - A single SDK instance concurrently started one model session for each
   profile; each session exposed the custom caller tool `get_test_word`. Under
   the built-in automatic permission policy, each live prompt returned exactly
   one caller-visible `tool_use`; each operation had an account-bound
-  `not-enforced` receipt. Attempting to use profile B's `tool_use` ID in
+  `ignored` receipt. Attempting to use profile B's `tool_use` ID in
   profile A's continuation was rejected with `InvalidRequestError` before a
   valid continuation. The correctly matched caller results were distinct
   random values absent from their prompts; each model returned its own
   caller-supplied result, ended with `end_turn`, and had a continuation receipt
   bound to its profile. On profile B, a separate native streamed handoff also
-  returned `tool_use` with a `not-enforced` receipt; non-streaming continuation
+  returned `tool_use` with an `ignored` receipt; non-streaming continuation
   with a fresh unique caller result completed. These are narrow observations,
   not proof of general MCP interoperability, identity
   separation, or approval behavior.
 - Optional Rosetta Chat and Responses adapters each returned expected text in
-  earlier live non-streaming requests with `not-enforced` metadata. Separate
+  earlier live non-streaming requests with `ignored` metadata. Separate
   streaming checks on profile A/Chat and profile B/Responses returned expected
-  content/completion with `not-enforced` metadata. These checks do not
+  content/completion with `ignored` metadata. These checks do not
   establish broad API compatibility.
 - In a separate native streaming check, early consumer return exposed the
-  initial `not-enforced` receipt; reusing that session then failed with
+  initial `ignored` receipt; reusing that session then failed with
   `SessionInterruptedError`. After the SDK and sessions were closed, the
   subsequent `ps` inspection showed no ACP or localharness processes. This is
   a bounded host observation, not a general process-cleanup guarantee.
@@ -344,24 +358,20 @@ presented as per-operation usage.
 
 ### A1–A5 policy and permission contracts
 
-`AntigravitySDK` accepts `maxTokensPolicy: "strict" | "allow-unenforced-max-tokens"`;
-omitting it pins `"strict"` for each account/session. Strict mode requires an
-explicit `maxTokens: "enforced"` capability and matching per-response
-admission. The official ACP driver does not provide that guarantee, so strict
-mode rejects before prompt dispatch and before any tool-result release.
+`maxTokensPolicy: "strict" | "allow-unenforced-max-tokens"` is retained as a
+legacy SDK option, but it never blocks inference. Official ACP has no
+per-response output-token enforcement: `max_tokens` is optional on native
+Messages requests; a valid supplied value is accepted but ignored, and an
+omission remains unbounded. No ACP output-cap parameter is invented and the
+SDK does not truncate its answer, so output, spend, and quota may exceed a
+supplied limit. ACP's reported `stop_reason: "max_tokens"` is preserved as its
+wire-level terminal reason and is not claimed to correspond to the caller's
+requested value. Resource-safety limits on event count and bytes remain
+independent and are not token enforcement.
 
-`allow-unenforced-max-tokens` is an explicit opt-in exception: native Messages
-requests may proceed through the official ACP event pump, but ACP receives no
-invented output-cap parameter, the SDK does not truncate its answer, and the
-answer may exceed the requested `max_tokens`, resulting in additional output,
-spend, and quota use. A response is **not** labeled with
-`stop_reason: "max_tokens"` when the requested bound was not enforced; an ACP
-`max_tokens` terminal in this mode is rejected rather than attributed to the
-request. Resource-safety limits on event count and bytes remain independent
-and are not token enforcement.
-
-The exact account/session/operation, response kind, requested limit, pinned
-policy, honest `enforced`/`not-enforced` outcome, and reason are available as
+The exact account/session/operation, response kind, optional requested limit,
+pinned legacy policy, honest `enforced`, `ignored`, or `unbounded` outcome, and
+reason are available as
 `session.diagnostics.snapshot().maxTokensEnforcement`; usage remains separate.
 This snapshot is session-scoped diagnostics, not an extension on the Anthropic
 `Message` payload; it identifies the latest admitted Messages operation for
@@ -426,8 +436,8 @@ details with redaction/truncation flags, `origin: "unverified"`, and an
 `AbortSignal` (string IDs are limited to 512 UTF-8 bytes and at most 64 offered
 options are exposed). The callback may deny or select an exact offered
 `allow_once` option; callback decisions cannot select `allow_always` or
-`reject_always` (automatic mode selects only offered allow options as described
-above).
+`reject_always` (automatic mode also selects only `allow_once`, and denies
+when none is offered).
 Opaque metadata and session identifiers are correlation data, not proof of
 origin. While callback work is pending, its signal is aborted on operation
 cancellation/change, terminal completion, timeout, session close, or profile
@@ -789,14 +799,13 @@ const message = await session.messages.create({
 });
 ```
 
-The built-in driver implements account/session-bound ACP startup, a shared
-`session/prompt` event pump, and same-prompt MCP park/continuation. Under
-`strict`, Messages admission rejects before dispatch because the official ACP
-backend's hard output-token enforcement is unverified. Under
-`allow-unenforced-max-tokens`, this pump may run with an explicit
-`not-enforced` admission and the exact requested limit retained in diagnostics;
-there is no ACP token-cap parameter or output truncation. An injected inference
-driver must keep its ACP session and return an explicit completed
+The built-in driver implements account/session-bound ACP startup, disables
+Antigravity built-in tools, registers only the session's client-defined MCP
+tools, and owns a shared `session/prompt` event pump with same-prompt
+MCP park/continuation. ACP has no hard output-token enforcement, so all
+operations proceed with an honest `ignored` admission for a supplied bound or
+`unbounded` when none was requested; no ACP token-cap parameter is added and no
+output is truncated. An injected inference driver must keep its ACP session and return an explicit completed
 assistant-text acknowledgement plus an ACP terminal `stopReason`. The
 `SessionDriverOperation` receives only the uncommitted transcript suffix,
 immutable account/session/configuration, an `acpPrompt` text-block mapping, and
@@ -813,19 +822,16 @@ prompt is a leading `<instruction>\n...\n</instruction>` text block. This is
 an explicit textual encoding, not a claim that ACP gives it native Anthropic
 role semantics. The driver must dispatch the supplied representation as-is.
 
-The S5 runtime request allowlist is exactly `max_tokens`, `messages`, and
-optional `stream: false`. `max_tokens` must be a positive safe integer and is
-required by Anthropic's request type. Strict mode rejects before dispatch
-unless the driver declares `capabilities: { maxTokens: "enforced" }` and
-implements `admitResponse(request)`. The explicit compatibility exception may
-instead use a `not-enforced` capability, but only when the SDK policy is
-`allow-unenforced-max-tokens`. In either mode, admission binds the exact
-account/session/operation/kind/requested limit/policy and must finish before
-prompt dispatch, or before any validated tool-result batch is persisted or
-released to ACP. The grant's outcome and reason are carried to the driver;
-compatibility grants explicitly say the backend does not enforce the bound.
-A capability declaration alone is insufficient, and injected/mock drivers do
-not prove their real backend enforces a hard limit.
+The S5 runtime request allowlist is exactly optional `max_tokens`, `messages`,
+and optional `stream: false`. A supplied `max_tokens` must be a positive safe
+integer; omission is valid. Official ACP always uses operation-bound admission,
+but reports a supplied bound as `ignored` and no supplied bound as `unbounded`.
+Admission binds the exact account/session/operation/kind/optional requested
+limit/policy and must finish before prompt dispatch, or before any validated
+tool-result batch is persisted or released to ACP. The bound is not sent as an
+ACP prompt parameter; no conversion default is treated as caller intent.
+Resource limits remain independent. Injected/mock driver declarations do not
+prove their real backend enforces a hard limit.
 
 Messages accepts non-empty full transcripts of `user`/`assistant` turns with
 plain string/text blocks and, when a matching SDK-owned handoff is active,
@@ -836,15 +842,15 @@ session creation. System prompts must be plain text or text blocks. Image,
 document, audio, unsupported roles/block metadata, sampling (`temperature`,
 `top_p`, `top_k`), stop sequences, thinking, structured output, tool choice,
 and all other unlisted request fields are rejected before dispatch. S6 adds
-`stream: true` only when the worker has separately declared bounded incremental
+`stream: true` only when the worker has separately declared incremental
 streaming support. Malformed values raise `InvalidRequestError`; unsupported
 valid semantics raise `UnsupportedFeatureError`.
 
 Explicit ACP results map `end_turn`, `max_tokens`, `refusal`, and
-`model_context_window_exceeded` to the corresponding Anthropic stop reasons
-only when the admission outcome is `enforced`. An ACP `max_tokens` stop under
-the compatibility policy is rejected rather than misreported as reaching the
-caller's requested bound.
+`model_context_window_exceeded` to the corresponding Anthropic stop reasons.
+An ACP `max_tokens` terminal is preserved even when a caller-supplied bound was
+ignored; the separate diagnostic makes clear that the reason is not attributed
+to that caller limit.
 `tool_use` is accepted only with a current `awaiting_tools` acknowledgement and
 one-to-one matched MCP waiters from the pinned caller catalog. Cancellation
 remains an error; stop-sequence, paused-turn, and unknown ACP stop reasons fail
@@ -888,13 +894,13 @@ current. The original S5 text-only path does not fabricate thinking blocks or
 signatures; S8 adds only receipt-matched caller `tool_use` content.
 
 S5/S6/S8 and S11.4/S11.5/A2 have deterministic fake-child coverage. The
-built-in driver implements ACP `session/prompt`, text pumping, authoritative
-MCP call correlation, and same-prompt continuation. In addition, the scoped
+built-in driver disables Antigravity built-in tools and implements ACP
+`session/prompt`, text pumping, authoritative client-MCP call correlation, and
+same-prompt continuation. In addition, the scoped
 live smoke tests above exercised native non-streaming and streaming text
 inference, caller-tool handoffs across two SDK-owned profiles (including one
-streamed handoff), and streaming and non-streaming adapter inference. Strict
-admission rejected before dispatch; compatibility responses carried
-`not-enforced` receipts. Those observations do not establish the official
+streamed handoff), and streaming and non-streaming adapter inference. Supplied
+output bounds were reported as `ignored`. Those observations do not establish the official
 backend's hard output-token enforcement, broad caller-tool interoperability,
 profile or identity isolation, or broad live behavior. The two-profile
 continuation observations below do not establish cross-process isolation.
@@ -903,14 +909,12 @@ continuation observations below do not establish cross-process isolation.
 
 `stream: true` returns a pull-based `AsyncIterable<RawMessageStreamEvent>` only
 when the driver declares `streaming: "incremental"`, implements
-`admitResponse(request)`, and implements `stream(operation)`. The same strict
-or explicit compatibility output-token policy applies to initial streams and
-tool continuations, with admission before prompt dispatch or result release.
-The built-in driver advertises incremental streaming and only advertises
-`not-enforced` admission when compatibility was explicitly selected. The
-Chat/Responses adapters preserve the session's strict default and disclose
-unenforced admission only under the explicit compatibility policy (see their
-sections below). A custom/injected worker declaration is an application
+`admitResponse(request)`, and implements `stream(operation)`. Supplied limits
+are ignored and omitted limits are unbounded for initial streams and tool
+continuations; admission still precedes prompt dispatch or result release. The
+built-in driver advertises incremental streaming and reports these states
+without claiming enforcement. The Chat/Responses adapters disclose the same
+state (see their sections below). A custom/injected worker declaration is an application
 contract and is not proof that an ACP implementation enforces limits or streams
 incrementally.
 
@@ -964,7 +968,7 @@ not known yet.
 The scoped live observations below include native text streaming, one streamed
 caller-tool handoff followed by non-streaming continuation, and an early
 consumer return that interrupted the session after exposing the initial
-`not-enforced` receipt. Those observations do not qualify broader live
+`ignored` receipt. Those observations do not qualify broader live
 streaming or worker behavior.
 
 ## Session caller-tool MCP transport (S7)
@@ -1187,7 +1191,7 @@ Supported Chat request subset:
 | Messages | `system`/`developer` only at the beginning; `user`, `assistant`, and `tool` messages. Text strings and text-only parts only. |
 | Assistant history | An explicit `content: ""` means an empty text block; `null` or an omitted `content` means no text block. Tool-only adapter responses use `content: null`. This distinction is retained when resubmitting the full transcript. |
 | Function tools | Function definitions only; explicit object JSON Schema; schema must exactly survive Rosetta conversion and equal the pinned catalog. Function-call arguments must be valid JSON objects. Every outstanding call needs one matching tool result before another message. IDs are preserved. |
-| `max_completion_tokens` / `max_tokens` | At most one positive safe integer. If omitted, Rosetta's explicit default is **4096**. The session must admit the exact converted bound. Strict sessions require `maxTokens: "enforced"`; a session explicitly configured with `allow-unenforced-max-tokens` may use a `not-enforced` admission and reports that fact. |
+| `max_completion_tokens` / `max_tokens` | At most one positive safe integer. Omission remains unbounded; Rosetta's converted **4096** default is not forwarded or reported as caller intent. A supplied value is accepted but official ACP ignores it and reports `outcome: "ignored"`. |
 | `n` | Omitted or exactly `1`. |
 | `stream` | Omitted/false for non-streaming or `true` for streaming. |
 | `stream_options` | On streams only, `{ include_usage?: boolean }`. A terminal usage chunk is emitted only when `include_usage: true`; unknown usage is `usage: null` with `usage_provenance`, not fabricated zero counts. |
@@ -1199,30 +1203,29 @@ and other OpenAI extensions. `n > 1`, malformed JSON arguments, partial or
 foreign tool-result batches, and schemas changed by Rosetta's sanitizer are
 rejected before inference. A non-stream response includes a
 `usage_provenance` and `max_tokens_enforcement` extensions; when diagnostics
-say usage is unknown, standard `usage` is `null`. The enforcement extension is
-an immutable receipt with account/session/operation IDs, `kind`, normalized
-`requestedMaxTokens`, `policy`, `outcome`, and `reason`. Stream chunks carry it
-from the initial role chunk through any terminal usage chunk, so clients can
-observe an unenforced bound before consuming output. ACP usage is session
+say usage is unknown, standard `usage` is `null`. The immutable diagnostic has
+account/session/operation IDs, `kind`, optional `requestedMaxTokens`, `policy`,
+`outcome`, and `reason`. Supplied limits report `ignored`; omissions report
+`unbounded`. Stream chunks carry it from the initial role chunk through any
+terminal usage chunk, so clients can see the bound state before output. ACP usage is session
 diagnostics, not an independent tokenizer measurement.
 
-Under `allow-unenforced-max-tokens`, the response is not capped locally. For
-example, requesting `max_tokens: 1` may still return a substantially longer
-answer; the adapter keeps the returned text and usage and reports
-`outcome: "not-enforced"`. It does not fabricate a `max_tokens` finish reason
-or truncate the output.
+The response is never capped locally. For example, requesting `max_tokens: 1`
+may still return a substantially longer answer; the adapter keeps the returned
+text and usage and reports `outcome: "ignored"`. An omitted limit reports
+`outcome: "unbounded"`. The adapter does not truncate output.
 
 ```ts
 import { createChatAdapter } from "antigravity-oauth-sdk/chat";
 
-const chat = createChatAdapter(session); // session belongs to an SDK configured with the explicit opt-in policy
+const chat = createChatAdapter(session);
 const completion = await chat.completions.create({
   model: session.configuration.model,
   messages: [{ role: "user", content: "Answer in detail." }],
   max_tokens: 1,
 });
 console.log(completion.max_tokens_enforcement);
-// `{ requestedMaxTokens: 1, outcome: "not-enforced", ... }` is disclosure,
+// `{ requestedMaxTokens: 1, outcome: "ignored", ... }` is disclosure,
 // not a promise that the returned answer contains at most one generated token.
 ```
 
@@ -1237,11 +1240,10 @@ The caller remains responsible for executing function tools and returning
 results. This adapter adds no fetch layer, inference server, credentials, or
 implicit environment lookup. Node 22+ is required. The scoped observations
 above include a live non-streaming Chat request and a separate streamed Chat
-request on profile A, both with `not-enforced` metadata. This does not qualify
+request on profile A, both with `ignored` metadata. This does not qualify
 broader live-account behavior, full Chat compatibility, or official hard
-`max_tokens` enforcement. Strict mode fails closed, while the explicit
-compatibility mode does not cap output and may result in additional spend and
-quota use.
+`max_tokens` enforcement. Output is not locally capped and may result in
+additional spend and quota use.
 
 ## Optional Rosetta Responses adapter (S10)
 
@@ -1322,7 +1324,7 @@ Supported Responses subset:
 | Function tools | Function tools only, with explicit object JSON Schemas that survive conversion unchanged and exactly equal the pinned catalog. Function arguments must be bounded valid JSON objects; call/result IDs are checked and retained. Names whose first `___` has non-empty text on both sides are rejected because Rosetta splits them into namespace/name fields; the adapter never rewrites them. |
 | `tool_choice` | Omitted/null or `"auto"` only. Forced, disabled, and hosted-tool choices are rejected. |
 | `parallel_tool_calls` | Omitted/null/`true`; `false` is rejected even without `tool_choice`, because the native Messages capability cannot enforce it. |
-| `max_output_tokens` | Positive safe integer or null. Rosetta's default when omitted/null is **4096**. The session must admit the exact converted bound. Strict sessions require `maxTokens: "enforced"`; the explicit compatibility policy may admit an unenforced bound and reports that fact. |
+| `max_output_tokens` | Positive safe integer or null. Omission/null stays unbounded; Rosetta's converted **4096** default is not forwarded or reported as caller intent. A supplied value is accepted but official ACP ignores it and reports `outcome: "ignored"`. |
 | `stream` | Omitted/false/null for non-streaming, or `true` for streaming. The driver must advertise incremental streaming. |
 
 All other request fields are rejected rather than dropped. In particular,
@@ -1334,8 +1336,10 @@ Responses server storage, retrieval, background jobs, or the full OpenAI API.
 
 Non-stream output uses Rosetta's Responses object/status mapping, with
 `usage_provenance` and immutable `max_tokens_enforcement` extensions. The
-enforcement receipt is checked against the exact `max_output_tokens` after
-Rosetta normalization (including its **4096** default). `usage` is `null` if the driver has not reported
+diagnostic is checked against the caller-supplied `max_output_tokens`, if any;
+Rosetta's conversion default is not caller intent. Omitted/null values report
+`outcome: "unbounded"`, while supplied values report `outcome: "ignored"` for
+official ACP. `usage` is `null` if the driver has not reported
 token usage or has not reported both cache buckets needed to calculate the
 Responses cache-inclusive input total. Otherwise, cache counts are projected
 from the operation diagnostic; an unknown reasoning-token detail is represented
@@ -1361,7 +1365,7 @@ successful terminal event is fabricated on cancellation. This adapter does not
 add a custom fetch, HTTP server, credential access, or automatic tool execution.
 Node 22+ is required. The scoped observations above include live non-streaming
 Responses and a separate streamed Responses request on profile B, both with
-`not-enforced` metadata. This does not qualify broader compatibility or
+`ignored` metadata. This does not qualify broader compatibility or
 platform support.
 
 ## Scope and lifecycle constraints
@@ -1384,11 +1388,10 @@ narrow target is:
 - The request transcript contains `user` and `assistant` turns with plain
   text, supported caller tool-use blocks, or supported caller tool-result
   blocks. Historical tool blocks are inert; active authority is receipt-bound.
-- `max_tokens` is admitted only with an exact per-response grant. Strict mode
-  requires the hard-enforcement contract; the approved explicit compatibility
-  policy may admit ACP's unenforced bound and reports that outcome without
-  truncating the answer. There is no live evidence that the official ACP
-  backend enforces a hard output-token limit.
+- `max_tokens` is optional. A supplied value is admitted and reported as
+  ignored by official ACP; an omitted value is admitted as unbounded. Exact
+  account/session/operation admission remains required. There is no evidence
+  that the official ACP backend enforces a hard output-token limit.
 - Streaming is outside S5 and belongs to S6. S7 adds the account/session-bound
   internal MCP registry; S8 adds receipt-backed caller-managed Messages
   handoff and continuation through an injected driver seam.
@@ -1435,13 +1438,11 @@ the SDK did not independently verify distinct underlying identities. Live
 refresh and logout were not run because they would alter the current
 credentials; true multi-account identity/isolation and cross-process isolation
 remain unqualified. Local status is intentionally not a remote validity check.
-The built-in ACP session/prompt
-event pump and park/continuation mechanics exist. Strict inference is denied
-until hard per-response `max_tokens` enforcement is established; the explicit
-opt-in compatibility path allows requests without enforcement and does not
-truncate output. Limited live inference is documented above; broader ACP/account
-behavior remains unqualified, and compatibility-mode answers may exceed their
-requested bounds and increase spend or quota use.
+The built-in ACP session/prompt event pump and park/continuation mechanics
+exist. Supplied `max_tokens` values are ignored, omitted values remain
+unbounded, and output is never truncated locally. Limited live inference is
+documented above; broader ACP/account behavior remains unqualified, and output
+may exceed a supplied bound and increase spend or quota use.
 Automatic session resume remains unimplemented. S8 receipts and S11.5
 continuation have fixture coverage; the limited live caller-tool handoffs
 described above do not qualify other tools or broader real-worker behavior.
@@ -1451,5 +1452,6 @@ The S5 usage placeholder policy and request/content allowlist are documented
 above. The profile-bound real ACP caller-tool handoffs documented above are
 limited observations; other tool paths and the real ACP driver's `max_tokens`
 enforcement remain unverified.
-Absent a valid strict or explicitly opted-in compatibility admission, the SDK
-rejects the request before dispatch.
+Every Messages operation still requires an operation-bound admission before
+dispatch or tool-result release. Missing admission support is rejected; a
+missing or unenforced output-token limit is not.

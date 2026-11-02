@@ -551,7 +551,7 @@ function validateConvertedMessages(value: unknown): void {
 }
 
 function validateConvertedRequest(request: SourceRequest, converted: ConvertedRequest, session: Session): {
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
   readonly messages: MessageCreateParamsNonStreaming["messages"];
   readonly stream: boolean;
 } {
@@ -584,12 +584,10 @@ function validateConvertedRequest(request: SourceRequest, converted: ConvertedRe
       throw unsupported("Rosetta would alter or weaken a function JSON Schema; conversion was rejected.");
     }
   }
-  const maxTokens = output.max_tokens;
-  if (!Number.isSafeInteger(maxTokens) || (maxTokens as number) < 1) {
-    throw protocol("Rosetta produced an invalid Messages max_tokens value.");
-  }
-  if (session.capabilities.maxTokens !== "enforced" && session.capabilities.maxTokens !== "not-enforced") {
-    throw unsupported("The session driver has not established max-token response admission for the Responses output bound.");
+  const requested = (request as unknown as JsonRecord).max_output_tokens;
+  const maxTokens = typeof requested === "number" ? requested : undefined;
+  if (maxTokens !== undefined && (!Number.isSafeInteger(maxTokens) || maxTokens < 1)) {
+    throw protocol("The validated Responses request has an invalid output-token value.");
   }
   const isStreaming = request.stream === true;
   if (isStreaming && session.capabilities.streaming !== "incremental") {
@@ -606,7 +604,7 @@ function validateConvertedRequest(request: SourceRequest, converted: ConvertedRe
   }
   validateConvertedMessages(output.messages);
   return {
-    maxTokens: maxTokens as number,
+    ...(maxTokens === undefined ? {} : { maxTokens }),
     messages: converted.messages as unknown as MessageCreateParamsNonStreaming["messages"],
     stream: isStreaming,
   };
@@ -615,16 +613,18 @@ function validateConvertedRequest(request: SourceRequest, converted: ConvertedRe
 function validateMaxTokensEnforcement(
   candidate: unknown,
   session: Session,
-  requestedMaxTokens: number,
+  requestedMaxTokens: number | undefined,
 ): MaxTokensEnforcementDiagnostic {
   const value = candidate;
   if (!value || !isRecord(value) || !Object.isFrozen(value) ||
       !exactKeys(value, [
-        "accountId", "sessionId", "operationId", "kind", "requestedMaxTokens", "policy", "outcome", "reason",
+        "accountId", "sessionId", "operationId", "kind", "policy", "outcome", "reason",
+        ...(Object.hasOwn(value, "requestedMaxTokens") ? ["requestedMaxTokens"] : []),
       ]) ||
       value.accountId !== session.accountId || value.sessionId !== session.sessionId ||
       typeof value.operationId !== "string" || value.operationId.length === 0 ||
       (value.kind !== "prompt" && value.kind !== "tool_continuation") ||
+      Object.hasOwn(value, "requestedMaxTokens") !== (requestedMaxTokens !== undefined) ||
       value.requestedMaxTokens !== requestedMaxTokens ||
       (value.policy !== "strict" && value.policy !== "allow-unenforced-max-tokens")) {
     throw protocol("The Messages response has no valid matching max_tokens admission diagnostic.");
@@ -638,24 +638,38 @@ function validateMaxTokensEnforcement(
       sessionId: value.sessionId,
       operationId: value.operationId,
       kind: value.kind,
-      requestedMaxTokens: value.requestedMaxTokens,
+      requestedMaxTokens: value.requestedMaxTokens as number,
       policy: value.policy,
       outcome: "enforced",
       reason: "driver-admitted-requested-bound",
     });
   }
-  if (value.outcome !== "not-enforced" || value.reason !== "backend-does-not-enforce-requested-bound" ||
-      value.policy !== "allow-unenforced-max-tokens" || session.capabilities.maxTokens !== "not-enforced") {
-    throw protocol("The Messages response's unenforced max_tokens admission does not match the explicit session policy.");
+  if (requestedMaxTokens === undefined) {
+    if (value.outcome !== "unbounded" || value.reason !== "no-output-token-bound-requested") {
+      throw protocol("The Messages response did not report its unbounded output-token request honestly.");
+    }
+    return Object.freeze({
+      accountId: value.accountId,
+      sessionId: value.sessionId,
+      operationId: value.operationId,
+      kind: value.kind,
+      policy: value.policy,
+      outcome: "unbounded",
+      reason: "no-output-token-bound-requested",
+    });
+  }
+  if (value.outcome !== "ignored" || value.reason !== "backend-does-not-enforce-requested-bound" ||
+      session.capabilities.maxTokens === "enforced") {
+    throw protocol("The Messages response's ignored max_tokens admission does not match the session capability.");
   }
   return Object.freeze({
     accountId: value.accountId,
     sessionId: value.sessionId,
     operationId: value.operationId,
     kind: value.kind,
-    requestedMaxTokens: value.requestedMaxTokens,
+    requestedMaxTokens: value.requestedMaxTokens as number,
     policy: value.policy,
-    outcome: "not-enforced",
+    outcome: "ignored",
     reason: "backend-does-not-enforce-requested-bound",
   });
 }
@@ -663,7 +677,7 @@ function validateMaxTokensEnforcement(
 function checkedMaxTokensEnforcement(
   response: object,
   session: Session,
-  requestedMaxTokens: number,
+  requestedMaxTokens: number | undefined,
 ): MaxTokensEnforcementDiagnostic {
   return validateMaxTokensEnforcement(messageMaxTokensEnforcement(response), session, requestedMaxTokens);
 }
@@ -1185,7 +1199,6 @@ function convertStream(
               validateConvertedStreamEvent(event, expectedSequence++);
               const nativeMetadata = validated.getMetadata();
               if (nativeMetadata !== undefined) {
-                if (requestedMaxTokens === undefined) throw protocol("The Responses stream lost its converted output-token bound.");
                 const observed = checkedMaxTokensEnforcement(nativeMetadata, session, requestedMaxTokens);
                 if (enforcement !== undefined && !jsonEqual(enforcement, observed)) {
                   throw protocol("The Responses stream changed its response-scoped max_tokens admission.");
@@ -1194,7 +1207,6 @@ function convertStream(
               } else if (enforcement === undefined && admissionReceipt !== undefined) {
                 const admitted = await admissionReceipt;
                 if (admitted !== undefined) {
-                  if (requestedMaxTokens === undefined) throw protocol("The Responses stream lost its converted output-token bound.");
                   enforcement = validateMaxTokensEnforcement(admitted, session, requestedMaxTokens);
                 }
               }
@@ -1237,7 +1249,6 @@ function convertStream(
             if (enforcement === undefined && admissionReceipt !== undefined) {
               const admitted = await admissionReceipt;
               if (admitted !== undefined) {
-                if (requestedMaxTokens === undefined) throw protocol("The Responses stream lost its converted output-token bound.");
                 enforcement = validateMaxTokensEnforcement(admitted, session, requestedMaxTokens);
               }
             }
@@ -1367,7 +1378,7 @@ function makeAdapter(session: Session): ResponsesAdapter {
     }
     const checked = validateConvertedRequest(request, converted, session);
     const nativeRequest = {
-      max_tokens: checked.maxTokens,
+      ...(checked.maxTokens === undefined ? {} : { max_tokens: checked.maxTokens }),
       messages: checked.messages,
     } as MessageCreateParamsNonStreaming;
     const message = await session.messages.create(
@@ -1412,7 +1423,7 @@ function makeAdapter(session: Session): ResponsesAdapter {
     }
     const checked = validateConvertedRequest(request, converted, session);
     const nativeRequest = {
-      max_tokens: checked.maxTokens,
+      ...(checked.maxTokens === undefined ? {} : { max_tokens: checked.maxTokens }),
       messages: checked.messages,
       stream: true,
     } as MessageCreateParamsStreaming;

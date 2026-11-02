@@ -28,20 +28,20 @@ type SessionPinnedFields = {
 
 export type MessageCreateParamsNonStreaming = Omit<
   Anthropic.Messages.MessageCreateParamsNonStreaming,
-  "model" | "system" | "tools"
+  "model" | "system" | "tools" | "max_tokens"
 > &
-  SessionPinnedFields;
+  SessionPinnedFields & { readonly max_tokens?: number };
 export type MessageCreateParamsStreaming = Omit<
   Anthropic.Messages.MessageCreateParamsStreaming,
-  "model" | "system" | "tools"
+  "model" | "system" | "tools" | "max_tokens"
 > &
-  SessionPinnedFields;
+  SessionPinnedFields & { readonly max_tokens?: number };
 
 export interface MessageCreateOptions {
   readonly signal?: AbortSignal;
 }
 
-/** SDK policy for required `max_tokens` when a worker does not enforce the bound. */
+/** Legacy policy option retained for compatibility; it never makes ACP enforce a token bound. */
 export type MaxTokensPolicy = "strict" | "allow-unenforced-max-tokens";
 
 /** A permission option exposed by ACP. ACP option names/metadata are not forwarded. */
@@ -106,13 +106,14 @@ export type AcpPermissionHandler = (
 
 /**
  * Built-in ACP permission policy. Omitting this option selects `mode: "auto"`:
- * the driver automatically chooses the first offered `allow_always`, falling
- * back to the first offered `allow_once`; it does not invoke a caller callback
- * or ask this SDK's caller for approval. `mode: "deny"` explicitly denies.
+ * the driver automatically chooses the first offered `allow_once` and denies
+ * when none is offered; it never selects `allow_always` and does not invoke a
+ * caller callback or ask this SDK's caller for approval. `mode: "deny"`
+ * explicitly denies.
  * The callback form preserves the existing opt-in one-shot decision API.
  *
  * ACP origin is unverified. Automatic approval can authorize arbitrary
- * agent-side effects; `allow_always` may persist beyond this SDK or session,
+ * agent-side effects; the SDK never requests a persistent `allow_always` grant,
  * and cancellation cannot retract approval bytes already written or grants
  * already persisted by the ACP agent. This SDK cannot revoke a prior written
  * approval or ACP-side persistent grant; `mode: "deny"` affects subsequent
@@ -136,7 +137,7 @@ export type AcpPermissionHandler = (
  */
 export type AcpPermissionsOptions =
   | {
-      /** Automatically choose the first offered allow_always, else allow_once. */
+      /** Automatically choose the first offered allow_once; deny if unavailable. */
       readonly mode: "auto";
       readonly timeoutMs?: number;
       readonly onRequest?: never;
@@ -160,26 +161,47 @@ export type AcpPermissionPolicy =
   | { readonly mode: "deny"; readonly timeoutMs: number }
   | { readonly mode: "callback"; readonly onRequest: AcpPermissionHandler; readonly timeoutMs: number };
 
-/** The two truthful outcomes reported for a requested output-token bound. */
+/** Truthful outcomes for an output-token bound or an explicitly unbounded request. */
 export type MaxTokensEnforcementOutcome =
   | {
       readonly outcome: "enforced";
       readonly reason: "driver-admitted-requested-bound";
     }
   | {
-      readonly outcome: "not-enforced";
+      readonly outcome: "ignored";
       readonly reason: "backend-does-not-enforce-requested-bound";
+    }
+  | {
+      readonly outcome: "unbounded";
+      readonly reason: "no-output-token-bound-requested";
     };
 
 /** Per-operation enforcement diagnostics; token usage is reported separately. */
-export type MaxTokensEnforcementDiagnostic = {
+type MaxTokensEnforcementDiagnosticBase = {
   readonly accountId: string;
   readonly sessionId: string;
   readonly operationId: string;
   readonly kind: "prompt" | "tool_continuation";
-  readonly requestedMaxTokens: number;
   readonly policy: MaxTokensPolicy;
-} & MaxTokensEnforcementOutcome;
+};
+
+export type MaxTokensEnforcementDiagnostic = MaxTokensEnforcementDiagnosticBase & (
+  | {
+      readonly requestedMaxTokens: number;
+      readonly outcome: "enforced";
+      readonly reason: "driver-admitted-requested-bound";
+    }
+  | {
+      readonly requestedMaxTokens: number;
+      readonly outcome: "ignored";
+      readonly reason: "backend-does-not-enforce-requested-bound";
+    }
+  | {
+      readonly requestedMaxTokens?: never;
+      readonly outcome: "unbounded";
+      readonly reason: "no-output-token-bound-requested";
+    }
+);
 
 /** Parameters fixed when constructing an account-bound session. */
 export interface SessionCreateOptions {
@@ -206,11 +228,81 @@ export interface AccountSessions {
   create(options: SessionCreateOptions): Promise<Session>;
 }
 
+/** Optional cancellation for an account metadata request. */
+export interface AccountDataRequestOptions {
+  readonly signal?: AbortSignal;
+}
+
+/** Verified identity returned by Google's OAuth user-info endpoint. */
+export interface AccountIdentity {
+  readonly accountId: string;
+  readonly providerId: string;
+  readonly email: string;
+  readonly emailVerified: true;
+}
+
+export interface AccountIdentityApi {
+  get(options?: AccountDataRequestOptions): Promise<AccountIdentity>;
+}
+
+/** A safe, bounded projection of one provider quota bucket. */
+export interface AccountQuotaBucket {
+  readonly modelId?: string;
+  readonly remainingFraction: number;
+  readonly resetTime?: string;
+  readonly window?: string | number | AccountQuotaWindow;
+}
+
+/** The supported scalar fields of a provider quota window descriptor. */
+export interface AccountQuotaWindow {
+  readonly startTime?: string;
+  readonly endTime?: string;
+  readonly duration?: string | number;
+  readonly unit?: string;
+  readonly type?: string;
+}
+
+export interface AccountQuotaGroup {
+  readonly id?: string;
+  readonly displayName?: string;
+  readonly buckets: readonly AccountQuotaBucket[];
+}
+
+export interface AccountQuotaSummary {
+  readonly accountId: string;
+  readonly observedAt: string;
+  readonly groups: readonly AccountQuotaGroup[];
+}
+
+export interface AccountQuotaApi {
+  summary(options?: AccountDataRequestOptions): Promise<AccountQuotaSummary>;
+}
+
+/** One model value advertised by the active ACP session/new response. */
+export interface AccountModel {
+  /** Exact model selector value advertised by ACP; suitable for sessions.create(). */
+  readonly id: string;
+  readonly name?: string;
+  readonly group?: string;
+}
+
+export interface AccountModelListOptions extends AccountDataRequestOptions {
+  /** Working directory supplied to the temporary, non-inference ACP session. */
+  readonly cwd: string;
+}
+
+export interface AccountModelCatalog {
+  list(options: AccountModelListOptions): Promise<readonly AccountModel[]>;
+}
+
 /** An explicit account-bound session. */
 export interface Account {
   readonly id: string;
   readonly auth: ProfileAuth;
   readonly sessions: AccountSessions;
+  readonly identity: AccountIdentityApi;
+  readonly quota: AccountQuotaApi;
+  readonly models: AccountModelCatalog;
 }
 
 /**
@@ -321,16 +413,33 @@ export interface SessionDriverContext {
   readonly maxTokensPolicy: MaxTokensPolicy;
 }
 
-/** A single response round admitted under the session's exact output-token policy. */
-export type SessionDriverResponseAdmission = {
+/** A single response round admitted under the session's operation policy. */
+type SessionDriverResponseAdmissionBase = {
   readonly kind: "prompt" | "tool_continuation";
   readonly operationId: string;
   readonly accountId: string;
   readonly sessionId: string;
-  readonly maxTokens: number;
   /** SDK policy pinned by the owning session engine. */
   readonly policy: MaxTokensPolicy;
-} & MaxTokensEnforcementOutcome;
+};
+
+export type SessionDriverResponseAdmission = SessionDriverResponseAdmissionBase & (
+  | {
+      readonly maxTokens: number;
+      readonly outcome: "enforced";
+      readonly reason: "driver-admitted-requested-bound";
+    }
+  | {
+      readonly maxTokens: number;
+      readonly outcome: "ignored";
+      readonly reason: "backend-does-not-enforce-requested-bound";
+    }
+  | {
+      readonly maxTokens?: never;
+      readonly outcome: "unbounded";
+      readonly reason: "no-output-token-bound-requested";
+    }
+);
 
 /** Admission is a pre-inference reservation and must not start the response. */
 export interface SessionDriverResponseAdmissionRequest {
@@ -338,7 +447,7 @@ export interface SessionDriverResponseAdmissionRequest {
   readonly operationId: string;
   readonly accountId: string;
   readonly sessionId: string;
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
   /** SDK policy pinned by the owning session engine. */
   readonly policy: MaxTokensPolicy;
   readonly signal: AbortSignal;
@@ -357,7 +466,7 @@ export interface SessionDriverOperation {
    * caller transcript or silently dropping its role/system tags.
    */
   readonly acpPrompt?: readonly AcpTextBlock[];
-  /** Required Anthropic bound, passed to a driver only after exact admission. */
+  /** Caller-supplied Anthropic bound, present only when one was requested. */
   readonly maxTokens?: number;
   /** Driver-issued exact admission grant; present for every Messages response. */
   readonly admission?: SessionDriverResponseAdmission;
@@ -382,7 +491,7 @@ export interface SessionMcpToolCallOptions {
 /**
  * Continuation seam for a worker that previously acknowledged `awaiting_tools`.
  * Before saving/releasing any result in this batch, the SDK calls
- * `admitResponse` with this continuation's exact `maxTokens`. Only after the
+ * `admitResponse` with this continuation's exact optional `maxTokens`. Only after the
  * matching grant returns does the SDK call `prepareToolContinuation`, then
  * durably save/release the results and wait for MCP delivery before consuming
  * this continuation. Preparation lets a parked protocol pump accept/buffer
@@ -399,7 +508,7 @@ export interface SessionDriverToolContinuation {
   readonly configuration: SessionConfiguration;
   /** New full-transcript suffix, including the caller's tool_result blocks. */
   readonly messages: SessionTranscript;
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
   /** Driver-issued grant produced before any result in this batch is released. */
   readonly admission: SessionDriverResponseAdmission;
   readonly results: readonly SessionDriverToolResult[];
@@ -470,14 +579,14 @@ export interface AcpTextBlock {
 /**
  * Driver capabilities are explicit assertions. `maxTokens: "enforced"` is a
  * promise that every Messages operation applies the supplied hard per-response
- * output limit. `"not-enforced"` is valid only when the owning SDK explicitly
- * pins `allow-unenforced-max-tokens`; it records compatibility admission, not a
- * hard bound. Runtime admission is required in both cases. Neither value is
- * inferred from ACP initialization or the selected model, and a declaration
- * alone does not prove that an arbitrary injected driver is honest.
+ * output limit. `"not-enforced"` records that supplied bounds are ignored; it
+ * never blocks admission. Runtime operation-bound admission is required either
+ * way. Neither value is inferred from ACP initialization or the selected model,
+ * and a declaration alone does not prove that an arbitrary injected driver is
+ * honest.
  */
 export interface SessionDriverCapabilities {
-  /** The driver applies the requested hard per-response output bound. */
+  /** Whether the driver applies supplied hard per-response output bounds. */
   readonly maxTokens?: "enforced" | "not-enforced";
   /** The driver provides a pull-based `stream()` iterator for text output. */
   readonly streaming?: "incremental";
@@ -502,15 +611,14 @@ export interface SessionDriverAcknowledgement {
   readonly result?: unknown;
 }
 
-/** Injectable stateful ACP-session seam; the built-in driver's inference stays gated without output-limit proof. */
+/** Injectable stateful ACP-session seam; every Messages operation still needs an operation-bound admission. */
 export interface SessionDriver {
   /**
    * Atomically admits one response round without starting inference. The exact
    * SDK policy and grant outcome/reason are carried to dispatch/stream or
-   * continuation. Implementations must reject unsupported policy/bounds here,
-   * before prompt dispatch or tool-result delivery, and must bind grants to the
-   * exact account/session/operation/kind/maxTokens/policy and consume them once.
-   * A `not-enforced` grant is legal only for the explicit compatibility policy;
+   * continuation. Implementations must bind grants to the exact
+   * account/session/operation/kind/optional maxTokens/policy and consume them
+   * once. `ignored` and `unbounded` report honestly when no bound is applied;
    * a fake implementation only qualifies mock behavior, not backend enforcement.
    */
   admitResponse?(request: SessionDriverResponseAdmissionRequest): Promise<SessionDriverResponseAdmission>;
@@ -684,7 +792,7 @@ export interface SessionToolCallReceipt {
 }
 
 export interface SessionLedgerMessageOptions extends SessionLedgerOperationOptions {
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
 }
 
 export interface ProfileSessionEngine {
@@ -702,6 +810,6 @@ export interface ProfileSessionEngineOptions {
   readonly workerManager: import("./auth.js").ProfileRuntimeManager;
   /** Maximum wait for streaming iterator/worker cleanup; defaults to 1,000 ms. */
   readonly streamCleanupTimeoutMs?: number;
-  /** Defaults to strict; carried to the driver as immutable SDK policy context. */
+  /** Legacy setting carried as immutable context; it does not block unbounded ACP inference. */
   readonly maxTokensPolicy?: MaxTokensPolicy;
 }

@@ -159,8 +159,8 @@ try {
     "With `--ignore-scripts`, `dist/` is not generated",
     "local, unpushed changes are not included",
     "omitting `permissions` selects automatic approval",
-    "first offered `allow_always`",
     "first offered `allow_once`",
+    "denies when",
     "ACP request origin is",
     "unverified",
     "arbitrary agent-side effects",
@@ -334,7 +334,7 @@ try {
   ], adapterConsumer);
 
   console.log(`Packed consumer smoke passed: ${packed.filename}; Node ${process.versions.node}.`);
-  console.log("Verified: packed permission docs/default types; optional peer absent for core; root import does not resolve Rosetta; constructor is inert; default driver fails closed; built-in compatibility, automatic/deny/callback permission paths compose from the packed root using only in-memory fake ACP/MCP; Chat nonstream and Responses stream disclose not-enforced from that same driver when the pinned peer is installed; no public server/inference export; Chat/Responses imports and declarations resolve with @zenmux/rosetta-ai@1.0.38.");
+  console.log("Verified: packed permission docs/default types; optional peer absent for core; root import does not resolve Rosetta; constructor is inert; default driver fails closed; built-in unbounded inference, automatic/deny/callback permission paths compose from the packed root using only in-memory fake ACP/MCP; Chat nonstream and Responses stream disclose ignored bounds from that same driver when the pinned peer is installed; no public server/inference export; Chat/Responses imports and declarations resolve with @zenmux/rosetta-ai@1.0.38.");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

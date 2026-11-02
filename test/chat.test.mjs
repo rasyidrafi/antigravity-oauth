@@ -88,12 +88,16 @@ async function makeFixture(root, {
             operationId: request.operationId,
             accountId: request.accountId,
             sessionId: request.sessionId,
-            maxTokens: request.maxTokens,
+            ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
             policy: request.policy,
-            outcome: effectiveCapabilities.maxTokens === "not-enforced" ? "not-enforced" : "enforced",
-            reason: effectiveCapabilities.maxTokens === "not-enforced"
-              ? "backend-does-not-enforce-requested-bound"
-              : "driver-admitted-requested-bound",
+            outcome: request.maxTokens === undefined
+              ? "unbounded"
+              : effectiveCapabilities.maxTokens === "not-enforced" ? "ignored" : "enforced",
+            reason: request.maxTokens === undefined
+              ? "no-output-token-bound-requested"
+              : effectiveCapabilities.maxTokens === "not-enforced"
+                ? "backend-does-not-enforce-requested-bound"
+                : "driver-admitted-requested-bound",
           };
         },
         async dispatch(operation) {
@@ -394,7 +398,7 @@ test("an explicit empty assistant text block survives response conversion and fu
   });
 });
 
-test("Rosetta's 4096 default is explicit, unknown usage is null, and max-token enforcement is not fabricated", async () => {
+test("Rosetta's 4096 default is not caller intent; omitted bounds remain unbounded", async () => {
   await withTempDirectory(async (root) => {
     const fixture = await makeFixture(root, {
       accountLabel: "default",
@@ -405,7 +409,9 @@ test("Rosetta's 4096 default is explicit, unknown usage is null, and max-token e
         model: "model-default",
         messages: [{ role: "user", content: "question" }],
       });
-      assert.equal(fixture.operations[0].maxTokens, 4096);
+      assert.equal(Object.hasOwn(fixture.operations[0], "maxTokens"), false);
+      assert.equal(completion.max_tokens_enforcement.outcome, "unbounded");
+      assert.equal(Object.hasOwn(completion.max_tokens_enforcement, "requestedMaxTokens"), false);
       assert.equal(completion.usage, null);
       assert.deepEqual(completion.usage_provenance, {
         kind: "unknown",
@@ -417,18 +423,19 @@ test("Rosetta's 4096 default is explicit, unknown usage is null, and max-token e
 
     const unbounded = await makeFixture(root, { accountLabel: "unbounded", capabilities: {} });
     try {
-      await assert.rejects(unbounded.chat.completions.create({
+      const completion = await unbounded.chat.completions.create({
         model: "model-unbounded",
-        messages: [{ role: "user", content: "must not dispatch" }],
-      }), UnsupportedFeatureError);
-      assert.equal(unbounded.operations.length, 0);
+        messages: [{ role: "user", content: "no bound" }],
+      });
+      assert.equal(completion.max_tokens_enforcement.outcome, "unbounded");
+      assert.equal(unbounded.operations.length, 1);
     } finally {
       await unbounded.close();
     }
   });
 });
 
-test("the opt-in Chat adapter discloses the exact converted limit without claiming or truncating enforcement", async () => {
+test("Chat distinguishes omitted limits from explicitly ignored caller limits", async () => {
   await withTempDirectory(async (root) => {
     let dispatch = 0;
     const answer = "This deliberately long answer exceeds a requested one-token output bound.";
@@ -447,7 +454,8 @@ test("the opt-in Chat adapter discloses the exact converted limit without claimi
         model: "model-compat-adapter",
         messages: [user("default limit")],
       });
-      assert.equal(fixture.operations[0].maxTokens, 4096, "Rosetta's omitted Chat limit is normalized before admission");
+      assert.equal(Object.hasOwn(fixture.operations[0], "maxTokens"), false,
+        "Rosetta's converted 4096 default is not forwarded as caller intent");
       assert.equal(first.choices[0].message.content, answer);
       const firstDisclosure = first.max_tokens_enforcement;
       assert.deepEqual(firstDisclosure, {
@@ -455,10 +463,9 @@ test("the opt-in Chat adapter discloses the exact converted limit without claimi
         sessionId: fixture.session.sessionId,
         operationId: fixture.operations[0].operationId,
         kind: "prompt",
-        requestedMaxTokens: 4096,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
-        reason: "backend-does-not-enforce-requested-bound",
+        outcome: "unbounded",
+        reason: "no-output-token-bound-requested",
       });
       assert.equal(Object.isFrozen(firstDisclosure), true);
 
@@ -471,7 +478,7 @@ test("the opt-in Chat adapter discloses the exact converted limit without claimi
       assert.equal(second.choices[0].message.content, answer, "the compatibility mode does not truncate an overshoot");
       assert.equal(second.usage.completion_tokens, 81);
       assert.equal(second.max_tokens_enforcement.requestedMaxTokens, 1);
-      assert.equal(second.max_tokens_enforcement.outcome, "not-enforced");
+      assert.equal(second.max_tokens_enforcement.outcome, "ignored");
       assert.equal(Object.isFrozen(second.max_tokens_enforcement), true);
       assert.deepEqual(first.max_tokens_enforcement, firstDisclosure, "a later operation cannot change response A's disclosure");
     } finally {
@@ -484,11 +491,12 @@ test("the opt-in Chat adapter discloses the exact converted limit without claimi
       capabilities: { maxTokens: "not-enforced" },
     });
     try {
-      await assert.rejects(strict.chat.completions.create({
+      const response = await strict.chat.completions.create({
         model: "model-strict-not-enforced-adapter",
-        messages: [user("must fail closed")],
-      }), UnsupportedFeatureError);
-      assert.equal(strict.operations.length, 0);
+        messages: [user("legacy strict does not block ACP")],
+      });
+      assert.equal(response.max_tokens_enforcement.outcome, "unbounded");
+      assert.equal(strict.operations.length, 1);
     } finally {
       await strict.close();
     }
@@ -532,7 +540,7 @@ test("opt-in Chat stream exposes immutable disclosure on its initial chunk and p
         kind: "prompt",
         requestedMaxTokens: 1,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
+        outcome: "ignored",
         reason: "backend-does-not-enforce-requested-bound",
       });
       assert.equal(Object.isFrozen(first.value.max_tokens_enforcement), true);
@@ -756,7 +764,7 @@ test("multi-call function IDs/results round-trip through the receipt-backed sess
       const first = await fixture.chat.completions.create(initial);
       assert.equal(first.max_tokens_enforcement.requestedMaxTokens, 60);
       assert.equal(first.max_tokens_enforcement.kind, "prompt");
-      assert.equal(first.max_tokens_enforcement.outcome, "not-enforced");
+      assert.equal(first.max_tokens_enforcement.outcome, "ignored");
       const assistantMessage = first.choices[0].message;
       assert.equal(assistantMessage.content, null, "tool-only output must not become an explicit empty text block");
       assert.deepEqual(assistantMessage.tool_calls.map(({ function: fn }) => fn.name), ["lookup", "lookup"]);
@@ -775,7 +783,6 @@ test("multi-call function IDs/results round-trip through the receipt-backed sess
           ...results,
         ],
         tools: [openAITool],
-        max_tokens: 13,
       });
       assert.equal(final.choices[0].message.content, "tools complete");
       assert.deepEqual(final.max_tokens_enforcement, {
@@ -783,11 +790,11 @@ test("multi-call function IDs/results round-trip through the receipt-backed sess
         sessionId: fixture.session.sessionId,
         operationId: fixture.continuations[0].operationId,
         kind: "tool_continuation",
-        requestedMaxTokens: 13,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
-        reason: "backend-does-not-enforce-requested-bound",
+        outcome: "unbounded",
+        reason: "no-output-token-bound-requested",
       });
+      assert.equal(Object.hasOwn(fixture.continuations[0], "maxTokens"), false);
       assert.equal(fixture.operations.length, 1);
       assert.equal(fixture.continuations.length, 1);
       assert.deepEqual(new Set(fixture.session.snapshot().transcript.at(-2).content.map(({ tool_use_id }) => tool_use_id)),

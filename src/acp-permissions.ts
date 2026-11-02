@@ -28,7 +28,8 @@ function copyDataProperties(value: unknown, allowed: readonly string[]): Record<
 
 /**
  * Validate and take an immutable snapshot of the public permission options.
- * An omitted policy is the built-in `auto` policy. This function deliberately
+ * An omitted policy is the built-in `auto` policy, which selects only
+ * `allow_once` and denies when it is unavailable. This function deliberately
  * only normalizes the selected policy; enforcement and guarded ACP writes are
  * owned by the built-in session driver.
  */

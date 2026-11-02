@@ -4,6 +4,9 @@ import type {
   AcpPermissionRequestContext,
   AcpPermissionsOptions,
   Account,
+  AccountIdentity,
+  AccountQuotaSummary,
+  AccountModel,
   AcpChildProcess,
   AcpConnection,
   AcpConnectionOptions,
@@ -105,6 +108,9 @@ const request: MessageCreateParamsNonStreaming = {
   max_tokens: 100,
   messages: [{ role: "user", content: "Hello" }],
 };
+const unboundedRequest: MessageCreateParamsNonStreaming = {
+  messages: [{ role: "user", content: "No output bound supplied." }],
+};
 
 const nonStreaming: Promise<Message> = session.messages.create(request);
 const withSignal: Promise<Message> = session.messages.create(request, { signal });
@@ -113,9 +119,19 @@ const streaming: Promise<AsyncIterable<RawMessageStreamEvent>> =
 void nonStreaming;
 void withSignal;
 void streaming;
+const unboundedMessage: Promise<Message> = session.messages.create(unboundedRequest);
+void unboundedMessage;
 
 const futureSession: Promise<Session> = account.sessions.create(createOptions);
 void futureSession;
+const providerIdentity: Promise<AccountIdentity> = account.identity.get({ signal });
+const providerQuota: Promise<AccountQuotaSummary> = account.quota.summary({ signal });
+const providerModels: Promise<readonly AccountModel[]> = account.models.list({ cwd: "/workspace", signal });
+void providerIdentity;
+void providerQuota;
+void providerModels;
+// @ts-expect-error ACP model discovery requires an explicit working directory.
+account.models.list({ signal });
 const closeSession: Promise<void> = session.close();
 void closeSession;
 
@@ -134,7 +150,7 @@ const ledgerMessage: Promise<Message> = ledgerHandle.messages.create(request);
 void ledgerMessage;
 const ledgerMessages = ledgerHandle.executeMessage(
   { transcript: request.messages },
-  { maxTokens: request.max_tokens },
+  { ...(request.max_tokens === undefined ? {} : { maxTokens: request.max_tokens }) },
 );
 void ledgerMessages;
 
@@ -154,10 +170,10 @@ const incrementalDriver: SessionDriver = {
       operationId: request.operationId,
       accountId: request.accountId,
       sessionId: request.sessionId,
-      maxTokens: request.maxTokens,
       policy: request.policy,
-      outcome: "enforced",
-      reason: "driver-admitted-requested-bound",
+      ...(request.maxTokens === undefined
+        ? { outcome: "unbounded", reason: "no-output-token-bound-requested" }
+        : { maxTokens: request.maxTokens, outcome: "enforced", reason: "driver-admitted-requested-bound" }),
     };
   },
   async dispatch(operation) {
@@ -266,8 +282,8 @@ const enforcedOutcome: MaxTokensEnforcementOutcome = {
   outcome: "enforced",
   reason: "driver-admitted-requested-bound",
 };
-const unenforcedOutcome: MaxTokensEnforcementOutcome = {
-  outcome: "not-enforced",
+const ignoredOutcome: MaxTokensEnforcementOutcome = {
+  outcome: "ignored",
   reason: "backend-does-not-enforce-requested-bound",
 };
 const policyDiagnostic: MaxTokensEnforcementDiagnostic = {
@@ -277,7 +293,16 @@ const policyDiagnostic: MaxTokensEnforcementDiagnostic = {
   kind: "prompt",
   requestedMaxTokens: 100,
   policy: compatibilityPolicy,
-  ...unenforcedOutcome,
+  ...ignoredOutcome,
+};
+const unboundedDiagnostic: MaxTokensEnforcementDiagnostic = {
+  accountId: "account",
+  sessionId: "session",
+  operationId: "operation-unbounded",
+  kind: "prompt",
+  policy: strictPolicy,
+  outcome: "unbounded",
+  reason: "no-output-token-bound-requested",
 };
 void strictPolicy;
 void sdkOptions;
@@ -287,6 +312,7 @@ void selectPermission;
 void permissionContext;
 void enforcedOutcome;
 void policyDiagnostic;
+void unboundedDiagnostic;
 
 // Policy and outcome fields remain discriminated and reject invented states.
 // @ts-expect-error unknown policy values are not part of the public contract.
@@ -295,8 +321,8 @@ void unknownPolicy;
 // @ts-expect-error ACP origin is unverified and cannot be promoted by a caller.
 const trustedOrigin: AcpPermissionRequestContext["origin"] = "trusted";
 void trustedOrigin;
-// @ts-expect-error a not-enforced result must use the truthful reason variant.
-const incompleteEnforcement: MaxTokensEnforcementOutcome = { outcome: "not-enforced", reason: "driver-admitted-requested-bound" };
+// @ts-expect-error an ignored result must use the truthful reason variant.
+const incompleteEnforcement: MaxTokensEnforcementOutcome = { outcome: "ignored", reason: "driver-admitted-requested-bound" };
 void incompleteEnforcement;
 // @ts-expect-error callbacks cannot return arbitrary allow booleans.
 const invalidPermissionHandler: AcpPermissionHandler = () => true;

@@ -18,6 +18,7 @@ import {
   createProfileRegistry,
 } from "../dist/index.js";
 import { normalizeAcpPermissionPolicy } from "../dist/acp-permissions.js";
+import { createAntigravitySDKWithModelDiscoveryFactoryForTests } from "../dist/sdk.js";
 
 const deferred = () => {
   let resolve;
@@ -105,10 +106,12 @@ const createSessionDriver = (context, onClose = () => {}) => ({
       operationId: request.operationId,
       accountId: request.accountId,
       sessionId: request.sessionId,
-      maxTokens: request.maxTokens,
+      ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
       policy: request.policy,
-      outcome: "enforced",
-      reason: "driver-admitted-requested-bound",
+      outcome: request.maxTokens === undefined ? "unbounded" : "enforced",
+      reason: request.maxTokens === undefined
+        ? "no-output-token-bound-requested"
+        : "driver-admitted-requested-bound",
     };
   },
   async dispatch(operation) {
@@ -627,6 +630,31 @@ test("the built-in ACP driver fails closed for an unreviewed executable", async 
     );
     assert.equal(processCalls, 0);
     await sdk.close();
+  });
+});
+
+test("SDK shutdown retains and retries a discovery lease whose request cleanup fails", async () => {
+  await withTempDirectory(async (root) => {
+    let closeAttempts = 0;
+    const sdk = createAntigravitySDKWithModelDiscoveryFactoryForTests({
+      storageDir: join(root, "profiles"),
+      executable: "/unused/agy_acp_server.par",
+    }, async () => ({
+      async list() { return Object.freeze([{ id: "advertised-model" }]); },
+      async close() {
+        closeAttempts += 1;
+        if (closeAttempts < 3) throw new Error("transient discovery cleanup failure");
+      },
+    }));
+    const account = await sdk.accounts.create();
+    await assert.rejects(account.models.list({ cwd: "/workspace" }), /transient discovery cleanup failure/);
+    assert.equal(closeAttempts, 1);
+
+    await assert.rejects(sdk.close(), ProcessFailureError);
+    assert.equal(closeAttempts, 2, "shutdown retries the retained discovery lease");
+
+    await sdk.close();
+    assert.equal(closeAttempts, 3, "a later shutdown retries an incomplete cleanup obligation");
   });
 });
 

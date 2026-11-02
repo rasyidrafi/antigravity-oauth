@@ -1,0 +1,31 @@
+{
+  "groups": [
+    {
+      "displayName": "Daily quota",
+      "buckets": [
+        {
+          "modelId": "model-fast",
+          "remainingFraction": 0.625,
+          "resetTime": "2026-11-02T00:00:00Z",
+          "window": "daily"
+        },
+        {
+          "modelId": "model-balanced",
+          "remainingFraction": 0.8,
+          "resetTime": "2026-11-02T00:00:00Z",
+          "window": "daily"
+        }
+      ]
+    },
+    {
+      "displayName": "Weekly quota",
+      "buckets": [
+        {
+          "remainingFraction": 0.9,
+          "resetTime": "2026-11-08T00:00:00Z",
+          "window": "weekly"
+        }
+      ]
+    }
+  ]
+}

@@ -601,7 +601,7 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     assert.equal(toolMessage.content[0].text, "before caller tool");
     assert.equal(toolReceipt?.requestedMaxTokens, 17);
     assert.equal(toolReceipt?.policy, "allow-unenforced-max-tokens");
-    assert.equal(toolReceipt?.outcome, "not-enforced");
+    assert.equal(toolReceipt?.outcome, "ignored");
     assert.equal(toolReceipt?.reason, "backend-does-not-enforce-requested-bound");
     assert.deepEqual(children[0].permissionOutcome, { outcome: "selected", optionId: "allow-once" });
     const toolUse = toolMessage.content.find(({ type }) => type === "tool_use");
@@ -616,7 +616,7 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     const continuationReceipt = api.messageMaxTokensEnforcement(completedToolMessage);
     assert.equal(continuationReceipt?.kind, "tool_continuation");
     assert.equal(continuationReceipt?.requestedMaxTokens, 19);
-    assert.equal(continuationReceipt?.outcome, "not-enforced");
+    assert.equal(continuationReceipt?.outcome, "ignored");
     assert.deepEqual(children[0].callerResult?.result?.content, [
       { type: "text", text: "caller-result-for-session-zero" },
     ]);
@@ -637,7 +637,7 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
       assert.equal(completion.choices[0].message.content, "Chat adapter output from session one");
       chatDisclosure = completion.max_tokens_enforcement;
       assert.equal(chatDisclosure.requestedMaxTokens, 37);
-      assert.equal(chatDisclosure.outcome, "not-enforced");
+      assert.equal(chatDisclosure.outcome, "ignored");
       adapterResponseIds.push(completion.id);
 
       const { createResponsesAdapter } = await import(new URL("./responses.js", pathToFileURL(entryPath)).href);
@@ -653,11 +653,11 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
       responsesDisclosure = responseEvents.find((event) => event.max_tokens_enforcement)?.max_tokens_enforcement;
       assert.ok(responsesDisclosure);
       assert.equal(responsesDisclosure.requestedMaxTokens, 41);
-      assert.equal(responsesDisclosure.outcome, "not-enforced");
+      assert.equal(responsesDisclosure.outcome, "ignored");
       assert.equal(responseEvents.some((event) => event.type === "response.output_text.delta" &&
         event.delta.includes("Responses adapter output from session two")), true);
       assert.equal(responseEvents.every((event) => !event.max_tokens_enforcement ||
-        event.max_tokens_enforcement.outcome === "not-enforced"), true);
+        event.max_tokens_enforcement.outcome === "ignored"), true);
       adapterResponseIds.push(responseEvents.find((event) => event.response)?.response.id);
     }
 
@@ -676,7 +676,7 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     assert.ok(streamStart);
     const streamReceipt = api.messageMaxTokensEnforcement(streamStart.message);
     assert.equal(streamReceipt?.requestedMaxTokens, 29);
-    assert.equal(streamReceipt?.outcome, "not-enforced");
+    assert.equal(streamReceipt?.outcome, "ignored");
     assert.equal(streamEvents.at(-1).type, "message_stop");
     assert.equal(streamEvents.filter((event) => event.type === "content_block_delta" &&
       event.delta.type === "text_delta").map((event) => event.delta.text).join(""),
@@ -696,7 +696,7 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     const textReceipt = api.messageMaxTokensEnforcement(textMessage);
     assert.equal(textMessage.content[0].text, "nonstream output from session two");
     assert.equal(textReceipt?.requestedMaxTokens, 31);
-    assert.equal(textReceipt?.outcome, "not-enforced");
+    assert.equal(textReceipt?.outcome, "ignored");
     assert.deepEqual(children[2].permissionOutcome, { outcome: "selected", optionId: "reject-once" });
 
     const controller = new AbortController();
@@ -717,7 +717,7 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
       }
     }
     assert.equal(api.messageMaxTokensEnforcement(startEvent.message)?.requestedMaxTokens, 43);
-    assert.equal(api.messageMaxTokensEnforcement(startEvent.message)?.outcome, "not-enforced");
+    assert.equal(api.messageMaxTokensEnforcement(startEvent.message)?.outcome, "ignored");
     controller.abort();
     await assert.rejects(iterator.next(), api.RequestAbortedError);
     assert.equal(sessions[3].state, "interrupted");
@@ -825,9 +825,9 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     assert.equal(sessions[3].state, "closed");
     assert.equal(children.every((child) => child.ended), true, "logout and SDK close leave no fake ACP child alive");
 
-    // Strict is still the omitted-policy default: the same built-in driver
-    // starts its ACP session but does not dispatch a prompt without a verified
-    // output-token enforcement capability.
+    // The legacy strict default does not block unbounded ACP inference.
+    const strictChildIndex = children.length;
+    permissionScenarios.set(strictChildIndex, { responseText: "unbounded request completed" });
     strictSdk = new api.AntigravitySDK({
       storageDir: join(root, "strict-profiles"),
       executable: "/fake/agy-acp",
@@ -836,12 +836,13 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
     const strictAccount = await strictSdk.accounts.create();
     const strictSession = await strictAccount.sessions.create({ model: "strict-model", cwd: "/workspace/strict" });
     const strictChild = children.at(-1);
-    await assert.rejects(
-      strictSession.messages.create({ max_tokens: 37, messages: [{ role: "user", content: "must not prompt" }] }),
-      api.UnsupportedFeatureError,
-    );
+    const unboundedMessage = await strictSession.messages.create({
+      messages: [{ role: "user", content: "no output bound supplied" }],
+    });
+    assert.equal(unboundedMessage.content[0].text, "unbounded request completed");
+    assert.equal(api.messageMaxTokensEnforcement(unboundedMessage)?.outcome, "unbounded");
     assert.equal(strictSession.configuration.model, "strict-model");
-    assert.equal(strictChild.writes.some(({ method }) => method === "session/prompt"), false);
+    assert.equal(strictChild.writes.some(({ method }) => method === "session/prompt"), true);
     await strictSdk.close();
     assert.equal(strictChild.ended, true);
 
@@ -886,7 +887,7 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
 
     const automaticRequests = [
       {
-        id: "public-auto-prefers-first-always",
+        id: "public-auto-selects-once-only",
         options: [
           { optionId: "public-auto-once-before-always", name: "Allow once", kind: "allow_once" },
           { optionId: "public-auto-always-first", name: "Always allow", kind: "allow_always" },
@@ -894,14 +895,14 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
         ],
       },
       {
-        id: "public-auto-falls-back-once",
+        id: "public-auto-selects-first-once",
         options: [
           { optionId: "public-auto-once-first", name: "Allow once", kind: "allow_once" },
           { optionId: "public-auto-once-second", name: "Also allow once", kind: "allow_once" },
         ],
       },
       {
-        id: "public-auto-repeats-without-callback",
+        id: "public-auto-denies-always-only",
         options: [
           { optionId: "public-auto-repeat-always-first", name: "Always allow", kind: "allow_always" },
           { optionId: "public-auto-repeat-always-second", name: "Also always allow", kind: "allow_always" },
@@ -954,23 +955,28 @@ test("public SDK uses the built-in compatibility driver with isolated sessions, 
       outcome: result?.outcome,
     })), [
       {
-        id: "public-auto-prefers-first-always",
-        outcome: { outcome: "selected", optionId: "public-auto-always-first" },
+        id: "public-auto-selects-once-only",
+        outcome: { outcome: "selected", optionId: "public-auto-once-before-always" },
       },
       {
-        id: "public-auto-falls-back-once",
+        id: "public-auto-selects-first-once",
         outcome: { outcome: "selected", optionId: "public-auto-once-first" },
       },
       {
-        id: "public-auto-repeats-without-callback",
-        outcome: { outcome: "selected", optionId: "public-auto-repeat-always-first" },
+        id: "public-auto-denies-always-only",
+        outcome: { outcome: "cancelled" },
       },
     ], "the ACP transport writes one response for each request, using the exact offered selection");
     for (const [requestIndex, request] of automaticRequests.entries()) {
       const response = automaticChild.permissionResponses[requestIndex];
-      assert.equal(request.options.some(({ optionId, kind }) =>
-        optionId === response?.result?.outcome?.optionId && (kind === "allow_always" || kind === "allow_once")), true,
-      "a positive selection is an exact ID/kind from that request's own offered options");
+      if (response?.result?.outcome?.outcome === "selected") {
+        assert.equal(request.options.some(({ optionId, kind }) =>
+          optionId === response.result.outcome.optionId && kind === "allow_once"), true,
+        "automatic approval selects only an exact offered allow_once ID");
+      } else {
+        assert.deepEqual(response?.result?.outcome, { outcome: "cancelled" },
+          "requests without allow_once are denied even if allow_always is offered");
+      }
       assert.equal(automaticChild.writes.filter(({ id }) => id === request.id).length, 1,
         `permission request ${request.id} has exactly one outbound response`);
     }

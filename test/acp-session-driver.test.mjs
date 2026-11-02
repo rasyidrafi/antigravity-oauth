@@ -722,14 +722,18 @@ test("explicit caller approval selects the exact offered one-shot option without
   });
 });
 
-test("the default automatic policy repeatedly prefers allow_always and falls back only to offered one-shot allows", async () => {
+test("the default automatic policy selects only one-shot allows and denies when none are offered", async () => {
   await withTempDirectory(async (root) => {
     const state = {};
-    const onlyAlways = [
+    const allowOnceAndAlways = [
       { optionId: "auto-once-first", name: "Allow once", kind: "allow_once" },
       { optionId: "auto-always-first", name: "Always allow", kind: "allow_always" },
       { optionId: "auto-always-second", name: "Also always allow", kind: "allow_always" },
       { optionId: "auto-reject", name: "Reject once", kind: "reject_once" },
+    ];
+    const alwaysOnly = [
+      { optionId: "always-only", name: "Always allow", kind: "allow_always" },
+      { optionId: "always-only-reject", name: "Reject once", kind: "reject_once" },
     ];
     const fallbackOnce = [
       { optionId: "fallback-once-first", name: "Allow once", kind: "allow_once" },
@@ -748,10 +752,11 @@ test("the default automatic policy repeatedly prefers allow_always and falls bac
       { optionId: "duplicate-option", name: "Reject once", kind: "reject_once" },
     ];
     const cases = [
-      ["auto-always-one", onlyAlways, "auto-always-first"],
-      ["auto-always-repeat", onlyAlways, "auto-always-first"],
+      ["auto-once-before-always", allowOnceAndAlways, "auto-once-first"],
+      ["auto-once-repeat", allowOnceAndAlways, "auto-once-first"],
       ["auto-once-fallback", fallbackOnce, "fallback-once-first"],
-      ["auto-without-mcp-marker", onlyAlways, "auto-always-first", false],
+      ["auto-without-mcp-marker", allowOnceAndAlways, "auto-once-first", false],
+      ["auto-always-only-denied", alwaysOnly, "always-only-reject"],
       ["auto-no-allow", noAllow, "no-allow-reject"],
       ["auto-reject-always-only", rejectAlwaysOnly, undefined],
       ["auto-malformed-duplicate", duplicateOptions, undefined],
@@ -863,7 +868,7 @@ test("MCP permission metadata is bounded opaque syntax and never creates caller-
       assert.deepEqual(response.content, [{ type: "text", text: "metadata did not call a tool" }]);
       for (const [name, _mcp, accepted] of cases) {
         assert.deepEqual(state.responses[name].result.outcome, accepted
-          ? { outcome: "selected", optionId: "opaque-allow-always" }
+          ? { outcome: "selected", optionId: "opaque-allow-once" }
           : { outcome: "cancelled" }, name);
       }
       assert.deepEqual(await session.diagnostics.toolHandoffs(), [],
@@ -1488,7 +1493,7 @@ test("queued permission approvals are revalidated immediately before the ACP std
   });
 });
 
-test("automatic allow_always responses are guarded through queued cancellation, deadline, terminal, and close transitions", async (t) => {
+test("automatic allow_once responses are guarded through queued cancellation, deadline, terminal, and close transitions", async (t) => {
   const runCase = async (root, kind) => {
     const controller = new AbortController();
     const timeoutMs = kind === "deadline" ? 25 : 2_000;
@@ -1555,8 +1560,8 @@ test("automatic allow_always responses are guarded through queued cancellation, 
       }
       assert.equal(child.writes.some((message) => message.id === id &&
         message.result?.outcome?.outcome === "selected" &&
-        message.result?.outcome?.optionId === "offered-allow-always"), false,
-      `${kind} must never write the stale automatic allow`);
+        message.result?.outcome?.optionId === "offered-allow-once"), false,
+      `${kind} must never write the stale automatic one-shot allow`);
       assert.equal(child.writes.filter((message) => message.id === id).length <= 1, true,
         "an inbound permission request receives at most one response");
     } finally {
@@ -1709,7 +1714,7 @@ test("a caller-tool continuation transition revokes an already-approved queued p
   });
 });
 
-test("automatic allow_always queued for one tool operation is cancelled when continuation takes ownership", async () => {
+test("automatic allow_once queued for one tool operation is cancelled when continuation takes ownership", async () => {
   await withTempDirectory(async (root) => {
     const callerResultsReady = deferred();
     const continueAgent = deferred();
@@ -2311,7 +2316,7 @@ test("session startup binds MCP before session/new, isolates account env, and ve
     const child = children[0];
     assert.ok(child);
     assert.deepEqual(child.writes.filter(({ method }) => method).map(({ method }) => method), ["initialize"]);
-    assert.equal(session.capabilities.maxTokens, undefined);
+    assert.equal(session.capabilities.maxTokens, "not-enforced");
 
     const mcpServer = await session.tools.createMcpServer();
     assert.deepEqual(child.writes.filter(({ method }) => method).map(({ method }) => method), [
@@ -2660,7 +2665,7 @@ test("malformed/unknown capabilities and runtime process crashes do not leave st
     });
     const account = await sdk.accounts.create();
     const session = await account.sessions.create({ model: "model-a", cwd: "/workspace" });
-    assert.deepEqual(session.capabilities, {});
+    assert.deepEqual(session.capabilities, { maxTokens: "not-enforced", streaming: "incremental" });
     await session.close();
     await sdk.close();
   }));
@@ -2690,15 +2695,22 @@ test("auth-required ACP failures and the browser-block marker stay noninteractiv
   }));
 });
 
-test("dispatch and stream are explicitly unsupported and never claim max token enforcement", async () => {
+test("the built-in ACP pump admits ignored and omitted token bounds honestly", async () => {
   await withTempDirectory(async (root) => {
     const children = [];
-    const drivers = [];
     const baseFactory = createFakeAcpSessionDriverFactory({
       executable: "/fake/agy-acp",
       args: ["--stdio"],
       processFactory: (_executable, _args, spawnOptions) => {
-        const child = new FakeAcpChild(spawnOptions, { onRequest: createAgentBehavior() });
+        const startup = createAgentBehavior();
+        const child = new FakeAcpChild(spawnOptions, { onRequest(message, current) {
+          if (message.method === "session/prompt") {
+            sendPromptText(current, message.params.sessionId, "unbounded answer");
+            current.reply(message.id, { stopReason: "end_turn" });
+            return;
+          }
+          startup(message, current);
+        } });
         children.push(child);
         return child;
       },
@@ -2707,38 +2719,27 @@ test("dispatch and stream are explicitly unsupported and never claim max token e
     const sdk = new AntigravitySDK({
       storageDir: join(root, "profiles"),
       executable: "/fake/agy-acp",
-      sessionDriverFactory: async (context) => {
-        const driver = await baseFactory(context);
-        drivers.push(driver);
-        return driver;
-      },
+      sessionDriverFactory: baseFactory,
     });
     const account = await sdk.accounts.create();
     const session = await account.sessions.create({ model: "model-a", cwd: "/workspace" });
-    assert.deepEqual(session.capabilities, {});
-    await assert.rejects(drivers[0].dispatch({}), UnsupportedFeatureError);
-    await assert.rejects(drivers[0].stream({})[Symbol.asyncIterator]().next(), UnsupportedFeatureError);
-    await assert.rejects(drivers[0].admitResponse({
-      kind: "prompt",
-      operationId: "op_direct-test",
-      accountId: session.accountId,
-      sessionId: session.sessionId,
-      maxTokens: 32,
-      signal: new AbortController().signal,
-    }), UnsupportedFeatureError);
-    await assert.rejects(drivers[0].admitResponse({
-      kind: "tool_continuation",
-      operationId: "op_direct-continuation-test",
-      accountId: session.accountId,
-      sessionId: session.sessionId,
-      maxTokens: 32,
-      signal: new AbortController().signal,
-    }), UnsupportedFeatureError);
-    await assert.rejects(drivers[0].continueTools({}), UnsupportedFeatureError);
-    await assert.rejects(drivers[0].streamTools({})[Symbol.asyncIterator]().next(), UnsupportedFeatureError);
-    await assert.rejects(session.messages.create({ max_tokens: 32, messages: [{ role: "user", content: "no inference" }] }),
-      UnsupportedFeatureError);
-    assert.equal(children[0].writes.some(({ method }) => method === "session/prompt"), false);
+    assert.deepEqual(session.capabilities, { maxTokens: "not-enforced", streaming: "incremental" });
+    const firstInput = [{ role: "user", content: "unbounded inference" }];
+    const response = await session.messages.create({ messages: firstInput });
+    assert.equal(response.stop_reason, "end_turn");
+    assert.equal((await session.diagnostics.snapshot()).maxTokensEnforcement.outcome, "unbounded");
+    assert.equal(children[0].writes.some(({ method }) => method === "session/prompt"), true);
+    const stream = await session.messages.create({
+      messages: [...firstInput, { role: "assistant", content: response.content }, { role: "user", content: "unbounded stream" }],
+      stream: true,
+    });
+    const events = [];
+    for await (const event of stream) events.push(event);
+    const start = events.find(({ type }) => type === "message_start");
+    assert.equal(messageMaxTokensEnforcement(start.message).outcome, "unbounded");
+    const prompts = children[0].writes.filter(({ method }) => method === "session/prompt");
+    assert.equal(prompts.length, 2);
+    assert.equal(prompts.every(({ params }) => !JSON.stringify(params).includes("max_tokens")), true);
     await session.close();
     await sdk.close();
   });
@@ -2856,7 +2857,7 @@ test("built-in ACP pump admits explicit unenforced limits without truncation and
         kind: "prompt",
         requestedMaxTokens: 1,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
+        outcome: "ignored",
         reason: "backend-does-not-enforce-requested-bound",
       });
       assert.equal(Object.isFrozen(firstDiagnostic), true);
@@ -2878,7 +2879,7 @@ test("built-in ACP pump admits explicit unenforced limits without truncation and
         kind: "prompt",
         requestedMaxTokens: 2,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
+        outcome: "ignored",
         reason: "backend-does-not-enforce-requested-bound",
       });
       assert.notEqual(firstDiagnostic.operationId, secondSnapshot.maxTokensEnforcement.operationId);
@@ -2903,13 +2904,18 @@ test("built-in ACP pump admits explicit unenforced limits without truncation and
   });
 });
 
-test("strict default rejects a built-in non-enforcing ACP driver before prompt dispatch", async () => {
+test("strict legacy policy admits unbounded official ACP inference without synthesizing a limit", async () => {
   await withTempDirectory(async (root) => {
     const fixture = createSdk(root, {
       behavior: (_index, requests) => {
         const startup = createAgentBehavior({ requests });
         return (message, child) => {
-          if (message.method === "session/prompt") requests.push(message);
+          if (message.method === "session/prompt") {
+            requests.push(message);
+            sendPromptText(child, message.params.sessionId, "unbounded official answer");
+            child.reply(message.id, { stopReason: "end_turn" });
+            return;
+          }
           startup(message, child);
         };
       },
@@ -2922,16 +2928,13 @@ test("strict default rejects a built-in non-enforcing ACP driver before prompt d
     });
     try {
       await session.tools.createMcpServer();
-      assert.equal(session.capabilities.maxTokens, undefined);
-      await assert.rejects(
-        session.messages.create({ max_tokens: 8, messages: [{ role: "user", content: "must not run" }] }),
-        UnsupportedFeatureError,
-      );
-      assert.equal(session.state, "idle");
-      assert.equal(fixture.requests.some(({ method }) => method === "session/prompt"), false);
-      assert.equal((await session.diagnostics.snapshot()).maxTokensEnforcement, undefined);
+      assert.equal(session.capabilities.maxTokens, "not-enforced");
+      const response = await session.messages.create({ messages: [{ role: "user", content: "no bound supplied" }] });
+      assert.equal(response.stop_reason, "end_turn");
+      assert.equal(Object.hasOwn(fixture.requests.find(({ method }) => method === "session/prompt").params, "max_tokens"), false);
+      assert.equal((await session.diagnostics.snapshot()).maxTokensEnforcement.outcome, "unbounded");
       assert.deepEqual(await session.diagnostics.toolHandoffs(), [],
-        "strict rejection creates no parked tool receipt and releases no result");
+        "unbounded inference creates no parked tool receipt unless ACP invokes a caller tool");
     } finally {
       await session.close();
       await fixture.sdk.close();
@@ -2939,7 +2942,7 @@ test("strict default rejects a built-in non-enforcing ACP driver before prompt d
   });
 });
 
-test("an unenforced ACP max_tokens terminal is never mislabeled as reaching the requested limit", async () => {
+test("an ACP max_tokens terminal is retained with an honest ignored-bound diagnostic", async () => {
   await withTempDirectory(async (root) => {
     const fixture = createSdk(root, {
       sdkOptions: { maxTokensPolicy: "allow-unenforced-max-tokens" },
@@ -2959,13 +2962,11 @@ test("an unenforced ACP max_tokens terminal is never mislabeled as reaching the 
     const account = await fixture.sdk.accounts.create();
     const session = await account.sessions.create({ model: "model-a", cwd: "/workspace/unbounded-stop" });
     try {
-      await assert.rejects(
-        session.messages.create({ max_tokens: 1, messages: [{ role: "user", content: "do not claim this cap" }] }),
-        UnsupportedFeatureError,
-      );
-      assert.deepEqual(session.snapshot().transcript, []);
-      assert.equal(session.state, "interrupted");
-      assert.equal((await session.diagnostics.snapshot()).maxTokensEnforcement.outcome, "not-enforced");
+      const response = await session.messages.create({ max_tokens: 1, messages: [{ role: "user", content: "do not claim this cap" }] });
+      assert.equal(response.stop_reason, "max_tokens", "the ACP terminal reason remains wire-faithful");
+      assert.equal(session.snapshot().transcript.length, 2);
+      assert.equal(session.state, "idle");
+      assert.equal((await session.diagnostics.snapshot()).maxTokensEnforcement.outcome, "ignored");
       assert.equal(fixture.requests.filter(({ method }) => method === "session/prompt").length, 1);
     } finally {
       await session.close();
@@ -2992,7 +2993,12 @@ test("unenforced tool continuations admit exact changed bounds before result rel
             return {
               ...driver,
               async admitResponse(request) {
-                timeline.push({ type: "admission", kind: request.kind, maxTokens: request.maxTokens, policy: request.policy });
+                timeline.push({
+                  type: "admission",
+                  kind: request.kind,
+                  ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
+                  policy: request.policy,
+                });
                 if (request.kind === "tool_continuation" && declineFirstContinuation) {
                   declineFirstContinuation = false;
                   throw new UnsupportedFeatureError("the compatibility limit was not admitted on the first attempt");
@@ -3056,7 +3062,7 @@ test("unenforced tool continuations admit exact changed bounds before result rel
             kind: "prompt",
             requestedMaxTokens: 17,
             policy: "allow-unenforced-max-tokens",
-            outcome: "not-enforced",
+            outcome: "ignored",
             reason: "backend-does-not-enforce-requested-bound",
           });
 
@@ -3065,10 +3071,14 @@ test("unenforced tool continuations admit exact changed bounds before result rel
             { role: "assistant", content: firstContent },
             { role: "user", content: [toolResult(firstTool, "caller result is longer than requested output cap")] },
           ];
+          const continuationMaxTokens = continuationStreaming ? 29 : undefined;
+          const continuationRequest = {
+            ...(continuationMaxTokens === undefined ? {} : { max_tokens: continuationMaxTokens }),
+            messages: continuationTranscript,
+          };
           if (continuationStreaming) {
             const rejected = await session.messages.create({
-              max_tokens: 29,
-              messages: continuationTranscript,
+              ...continuationRequest,
               stream: true,
             });
             await assert.rejects(async () => {
@@ -3076,7 +3086,7 @@ test("unenforced tool continuations admit exact changed bounds before result rel
             }, UnsupportedFeatureError);
           } else {
             await assert.rejects(
-              session.messages.create({ max_tokens: 29, messages: continuationTranscript }),
+              session.messages.create(continuationRequest),
               UnsupportedFeatureError,
             );
           }
@@ -3086,8 +3096,7 @@ test("unenforced tool continuations admit exact changed bounds before result rel
 
           if (continuationStreaming) {
             const stream = await session.messages.create({
-              max_tokens: 29,
-              messages: continuationTranscript,
+              ...continuationRequest,
               stream: true,
             });
             const events = [];
@@ -3100,23 +3109,33 @@ test("unenforced tool continuations admit exact changed bounds before result rel
               sessionId: session.sessionId,
               operationId: (await session.diagnostics.snapshot()).maxTokensEnforcement.operationId,
               kind: "tool_continuation",
-              requestedMaxTokens: 29,
               policy: "allow-unenforced-max-tokens",
-              outcome: "not-enforced",
-              reason: "backend-does-not-enforce-requested-bound",
+              ...(continuationMaxTokens === undefined ? {
+                outcome: "unbounded",
+                reason: "no-output-token-bound-requested",
+              } : {
+                requestedMaxTokens: continuationMaxTokens,
+                outcome: "ignored",
+                reason: "backend-does-not-enforce-requested-bound",
+              }),
             });
           } else {
-            const response = await session.messages.create({ max_tokens: 29, messages: continuationTranscript });
+            const response = await session.messages.create(continuationRequest);
             assert.deepEqual(response.content, [{ type: "text", text: "continuation completed without an output cap" }]);
             assert.deepEqual(messageMaxTokensEnforcement(response), {
               accountId: session.accountId,
               sessionId: session.sessionId,
               operationId: (await session.diagnostics.snapshot()).maxTokensEnforcement.operationId,
               kind: "tool_continuation",
-              requestedMaxTokens: 29,
               policy: "allow-unenforced-max-tokens",
-              outcome: "not-enforced",
-              reason: "backend-does-not-enforce-requested-bound",
+              ...(continuationMaxTokens === undefined ? {
+                outcome: "unbounded",
+                reason: "no-output-token-bound-requested",
+              } : {
+                requestedMaxTokens: continuationMaxTokens,
+                outcome: "ignored",
+                reason: "backend-does-not-enforce-requested-bound",
+              }),
             });
           }
           await agentDone.promise;
@@ -3127,7 +3146,7 @@ test("unenforced tool continuations admit exact changed bounds before result rel
           assert.deepEqual(continuationAdmission, {
             type: "admission",
             kind: "tool_continuation",
-            maxTokens: 29,
+            ...(continuationMaxTokens === undefined ? {} : { maxTokens: continuationMaxTokens }),
             policy: "allow-unenforced-max-tokens",
           });
           assert.ok(timeline.findIndex(({ type, kind }) => type === "admission" && kind === "tool_continuation") < release,
@@ -3182,7 +3201,7 @@ test("built-in unenforced grants bind policy, identity, operation, kind, and lim
         sessionId: session.sessionId,
         maxTokens: 11,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
+        outcome: "ignored",
         reason: "backend-does-not-enforce-requested-bound",
       });
       assert.equal(Object.isFrozen(grant), true);
@@ -3315,7 +3334,7 @@ test("unenforced admission failure, cancellation, and same-session waiter races 
         kind: "prompt",
         requestedMaxTokens: 37,
         policy: "allow-unenforced-max-tokens",
-        outcome: "not-enforced",
+        outcome: "ignored",
         reason: "backend-does-not-enforce-requested-bound",
       });
       assert.equal(fixture.requests.filter(({ method }) => method === "session/prompt").length, 1);
@@ -3369,7 +3388,7 @@ test("compatibility admission and output stay isolated across two accounts and t
           kind: "prompt",
           requestedMaxTokens: index + 1,
           policy: "allow-unenforced-max-tokens",
-          outcome: "not-enforced",
+          outcome: "ignored",
           reason: "backend-does-not-enforce-requested-bound",
         });
         accountSessionPairs.add(`${diagnostic.accountId}/${diagnostic.sessionId}`);

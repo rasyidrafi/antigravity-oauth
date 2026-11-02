@@ -29,7 +29,7 @@ type JsonRecord = Record<string, unknown>;
 type TextPart = { readonly type: "text"; readonly text: string };
 type NormalizedRequest = {
   readonly messages: SessionTranscript;
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
   readonly stream: boolean;
 };
 
@@ -273,13 +273,12 @@ function normalizeRequest(value: unknown): NormalizedRequest {
   if (keys.some((key) => typeof key !== "string" || !allowed.has(key))) {
     throw new UnsupportedFeatureError("The Messages request contains fields outside the supported S5 subset.");
   }
-  if (!Object.prototype.hasOwnProperty.call(request, "max_tokens")) {
-    throw invalidRequest("max_tokens is required by the Anthropic Messages contract.");
-  }
   if (!Object.prototype.hasOwnProperty.call(request, "messages")) {
     throw invalidRequest("messages is required by the Anthropic Messages contract.");
   }
-  if (typeof request.max_tokens !== "number" || !Number.isSafeInteger(request.max_tokens) || request.max_tokens < 1) {
+  const maxTokens = request.max_tokens;
+  if (maxTokens !== undefined &&
+      (typeof maxTokens !== "number" || !Number.isSafeInteger(maxTokens) || maxTokens < 1)) {
     throw invalidRequest("max_tokens must be a positive safe integer.");
   }
   if (Object.prototype.hasOwnProperty.call(request, "stream")) {
@@ -287,7 +286,7 @@ function normalizeRequest(value: unknown): NormalizedRequest {
   }
   return Object.freeze({
     messages: normalizeMessages(request.messages),
-    maxTokens: request.max_tokens,
+    ...(maxTokens === undefined ? {} : { maxTokens }),
     stream: request.stream === true,
   });
 }
@@ -628,17 +627,21 @@ function checkedContextOccupancy(value: unknown): ContextOccupancyDiagnostic {
 
 function checkedMaxTokensEnforcement(value: unknown): MaxTokensEnforcementDiagnostic {
   if (!isDataRecord(value) || !exactKeys(value, [
-    "accountId", "sessionId", "operationId", "kind", "requestedMaxTokens", "policy", "outcome", "reason",
+      "accountId", "sessionId", "operationId", "kind", "policy", "outcome", "reason",
+      ...(Object.hasOwn(value, "requestedMaxTokens") ? ["requestedMaxTokens"] : []),
   ]) || typeof value.accountId !== "string" || value.accountId.length === 0 ||
       typeof value.sessionId !== "string" || value.sessionId.length === 0 ||
       typeof value.operationId !== "string" || value.operationId.length === 0 ||
       (value.kind !== "prompt" && value.kind !== "tool_continuation") ||
-      !Number.isSafeInteger(value.requestedMaxTokens) || (value.requestedMaxTokens as number) < 1 ||
+      (Object.hasOwn(value, "requestedMaxTokens") &&
+        (!Number.isSafeInteger(value.requestedMaxTokens) || (value.requestedMaxTokens as number) < 1)) ||
       (value.policy !== "strict" && value.policy !== "allow-unenforced-max-tokens") ||
       (value.outcome === "enforced"
-        ? value.reason !== "driver-admitted-requested-bound"
-        : value.outcome !== "not-enforced" || value.reason !== "backend-does-not-enforce-requested-bound") ||
-      (value.outcome === "not-enforced" && value.policy !== "allow-unenforced-max-tokens")) {
+        ? value.reason !== "driver-admitted-requested-bound" || !Object.hasOwn(value, "requestedMaxTokens")
+        : value.outcome === "ignored"
+          ? value.reason !== "backend-does-not-enforce-requested-bound" || !Object.hasOwn(value, "requestedMaxTokens")
+          : value.outcome !== "unbounded" || value.reason !== "no-output-token-bound-requested" ||
+            Object.hasOwn(value, "requestedMaxTokens"))) {
     throw protocolFailure("A Messages response has invalid max_tokens admission diagnostics.");
   }
   const base: Omit<MaxTokensEnforcementDiagnostic, "outcome" | "reason"> = {
@@ -646,12 +649,21 @@ function checkedMaxTokensEnforcement(value: unknown): MaxTokensEnforcementDiagno
     sessionId: value.sessionId as string,
     operationId: value.operationId as string,
     kind: value.kind as "prompt" | "tool_continuation",
-    requestedMaxTokens: value.requestedMaxTokens as number,
     policy: value.policy as "strict" | "allow-unenforced-max-tokens",
   };
   return value.outcome === "enforced"
-    ? Object.freeze({ ...base, outcome: "enforced" as const, reason: "driver-admitted-requested-bound" as const })
-    : Object.freeze({ ...base, outcome: "not-enforced" as const, reason: "backend-does-not-enforce-requested-bound" as const });
+    ? Object.freeze({ ...base, requestedMaxTokens: value.requestedMaxTokens as number, outcome: "enforced" as const, reason: "driver-admitted-requested-bound" as const })
+    : value.outcome === "ignored"
+      ? Object.freeze({ ...base, requestedMaxTokens: value.requestedMaxTokens as number, outcome: "ignored" as const, reason: "backend-does-not-enforce-requested-bound" as const })
+      : Object.freeze({
+          accountId: value.accountId as string,
+          sessionId: value.sessionId as string,
+          operationId: value.operationId as string,
+          kind: value.kind as "prompt" | "tool_continuation",
+          policy: value.policy as "strict" | "allow-unenforced-max-tokens",
+          outcome: "unbounded" as const,
+          reason: "no-output-token-bound-requested" as const,
+        });
 }
 
 /** Accumulate shared semantic events into one native Anthropic Message. */
@@ -838,11 +850,6 @@ function outputFromReceipt(receipt: SessionLedgerReceipt): SessionDriverAcknowle
 function validateMessagesCapability(ledger: SessionLedger, configuration: SessionConfiguration): void {
   // Validate pinned settings before any worker dispatch.
   systemText(configuration);
-  if (!ledger.capabilities.maxTokens) {
-    throw new UnsupportedFeatureError(
-      "The session driver has not established an admitted max_tokens policy; the required Anthropic bound cannot be ignored.",
-    );
-  }
 }
 
 function streamMessages(
@@ -1058,7 +1065,7 @@ export function createSessionMessages(ledger: SessionLedger): SessionMessages {
     readSuffix(request.messages, before.transcript);
     const receipt = await ledger.executeMessage(
       { transcript: request.messages },
-      { maxTokens: request.maxTokens, ...(options.signal === undefined ? {} : { signal: options.signal }) },
+      { ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }), ...(options.signal === undefined ? {} : { signal: options.signal }) },
     );
     const normalized = normalizeMessagesAcknowledgement(outputFromReceipt(receipt));
     const accumulator = new MessageAccumulator(configuration.model);
@@ -1085,7 +1092,7 @@ export function createSessionMessages(ledger: SessionLedger): SessionMessages {
     readSuffix(request.messages, before.transcript);
     const semantic = ledger.streamMessage(
       { transcript: request.messages },
-      { maxTokens: request.maxTokens, ...(options.signal === undefined ? {} : { signal: options.signal }) },
+      { ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }), ...(options.signal === undefined ? {} : { signal: options.signal }) },
     );
     return streamMessages(semantic, configuration.model);
   }

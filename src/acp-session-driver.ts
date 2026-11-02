@@ -3,6 +3,7 @@ import { InvalidRequestError, ProcessFailureError, ProtocolFailureError, Request
 import { AcpMethodNotFoundError, connectAcp, type AcpConnection, type ProcessFactory } from "./acp.js";
 import { createGuardedPermissionResponse } from "./acp-permission-response.js";
 import { assertReviewedAcpPair } from "./acp-compatibility.js";
+import { extractAcpAdvertisedModels } from "./acp-models.js";
 import { createNoninteractiveAuthGuard, type NoninteractiveAuthGuard } from "./noninteractive-auth.js";
 import { normalizeAcpPermissionPolicy } from "./acp-permissions.js";
 import type {
@@ -52,7 +53,6 @@ const MAX_PERMISSION_CALLBACK_TIMEOUT_MS = 60_000;
 const MAX_CONCURRENT_PERMISSION_CALLBACKS = 8;
 const MAX_PERMISSION_DETAIL_BYTES = 256;
 const MCP_SERVER_NAME = "antigravity-sdk-session-tools";
-const UNSUPPORTED_PROMPT_MESSAGE = "The built-in ACP driver cannot honor a strict per-response output-token bound.";
 const ACP_PERMISSION_OPTION_KINDS = new Set(["allow_once", "allow_always", "reject_once", "reject_always"]);
 const ACP_TOOL_KINDS = new Set(["read", "edit", "delete", "move", "search", "execute", "think", "fetch", "switch_mode", "other"]);
 const ACP_TOOL_STATUSES = new Set(["pending", "in_progress", "completed", "failed"]);
@@ -213,10 +213,10 @@ interface TestAdmissionRecord {
   readonly operationId: string;
   readonly accountId: string;
   readonly sessionId: string;
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
   readonly policy: MaxTokensPolicy;
-  readonly outcome: "enforced" | "not-enforced";
-  readonly reason: "driver-admitted-requested-bound" | "backend-does-not-enforce-requested-bound";
+  readonly outcome: "enforced" | "ignored" | "unbounded";
+  readonly reason: "driver-admitted-requested-bound" | "backend-does-not-enforce-requested-bound" | "no-output-token-bound-requested";
   readonly signal: AbortSignal;
   readonly onAbort: () => void;
 }
@@ -420,14 +420,13 @@ function permissionResponse(
 
 /**
  * Resolve an automatic/callback allow only when the exact option ID and kind
- * are still present in the validated offer. Caller callbacks are separately
- * restricted to `allow_once`; only the built-in automatic policy can request
- * `allow_always` here.
+ * are still present in the validated offer. Both automatic and callback
+ * approvals are restricted to `allow_once`.
  */
 function selectedAllowPermissionResponse(
   options: ValidPermissionRequest["options"],
   optionId: string,
-  kind: "allow_once" | "allow_always",
+  kind: "allow_once",
 ): Readonly<Record<string, unknown>> | undefined {
   const selected = options.find((option) => option.optionId === optionId && option.kind === kind);
   return selected
@@ -437,11 +436,10 @@ function selectedAllowPermissionResponse(
 
 function automaticPermissionSelection(
   request: ValidPermissionRequest,
-): { readonly optionId: string; readonly kind: "allow_always" | "allow_once" } | undefined {
-  const selected = request.options.find(({ kind }) => kind === "allow_always") ??
-    request.options.find(({ kind }) => kind === "allow_once");
-  return selected && (selected.kind === "allow_always" || selected.kind === "allow_once")
-    ? Object.freeze({ optionId: selected.optionId, kind: selected.kind })
+): { readonly optionId: string; readonly kind: "allow_once" } | undefined {
+  const selected = request.options.find(({ kind }) => kind === "allow_once");
+  return selected
+    ? Object.freeze({ optionId: selected.optionId, kind: "allow_once" as const })
     : undefined;
 }
 
@@ -1278,10 +1276,7 @@ async function createSessionDriver(
   let closePromise: Promise<void> | undefined;
   const maxTokensOutcome = dependencies.enforceMaxTokens !== undefined
     ? "enforced" as const
-    : context.maxTokensPolicy === "allow-unenforced-max-tokens" ? "not-enforced" as const : undefined;
-  const maxTokensReason = maxTokensOutcome === "enforced"
-    ? "driver-admitted-requested-bound" as const
-    : "backend-does-not-enforce-requested-bound" as const;
+    : "not-enforced" as const;
 
   const abortPermissionDecisions = (turn?: ActivePromptTurn, operationId?: string): void => {
     for (const pending of pendingPermissionDecisions) {
@@ -1764,18 +1759,19 @@ async function createSessionDriver(
     }
 
     const driver: SessionDriver = {
-      capabilities: Object.freeze(maxTokensOutcome === undefined
-        ? {}
-        : { maxTokens: maxTokensOutcome, streaming: "incremental" as const }),
+      capabilities: Object.freeze({ maxTokens: maxTokensOutcome, streaming: "incremental" as const }),
       acpActivityDiagnostics: () => Object.freeze({ ...acpActivityDiagnostics }),
       notifications: () => notificationBuffer,
       async admitResponse(request) {
-        if (!maxTokensOutcome) throw unsupported(UNSUPPORTED_PROMPT_MESSAGE);
-        if (!isRecord(request) || !exactKeys(request, ["kind", "operationId", "accountId", "sessionId", "maxTokens", "policy", "signal"]) ||
+        const hasMaxTokens = isRecord(request) && Object.hasOwn(request, "maxTokens");
+        if (!isRecord(request) || !exactKeys(request, [
+          "kind", "operationId", "accountId", "sessionId", "policy", "signal",
+          ...(hasMaxTokens ? ["maxTokens"] : []),
+        ]) ||
             (request.kind !== "prompt" && request.kind !== "tool_continuation") ||
             typeof request.operationId !== "string" || request.operationId.length === 0 ||
             request.accountId !== context.accountId || request.sessionId !== context.sessionId ||
-            !Number.isSafeInteger(request.maxTokens) || (request.maxTokens as number) < 1 ||
+            (hasMaxTokens && (!Number.isSafeInteger(request.maxTokens) || (request.maxTokens as number) < 1)) ||
             request.policy !== context.maxTokensPolicy ||
             !isAbortSignal(request.signal)) {
           throw new InvalidRequestError("The ACP response admission request is invalid or belongs to another session.");
@@ -1785,7 +1781,7 @@ async function createSessionDriver(
           throw new InvalidRequestError("Bind this session's MCP server before starting a tool-enabled prompt.");
         }
         const checked = request as unknown as SessionDriverResponseAdmissionRequest;
-        const allowed = dependencies.enforceMaxTokens
+        const allowed = dependencies.enforceMaxTokens && hasMaxTokens
           ? await dependencies.enforceMaxTokens(checked)
           : true;
         if (request.signal.aborted || isClosed) throw new RequestAbortedError("The ACP response admission was cancelled.");
@@ -1798,20 +1794,35 @@ async function createSessionDriver(
           operationId: checked.operationId,
           accountId: checked.accountId,
           sessionId: checked.sessionId,
-          maxTokens: checked.maxTokens,
           policy: checked.policy,
         };
-        const grant: SessionDriverResponseAdmission = maxTokensOutcome === "enforced"
+        const requestedOutcome = checked.maxTokens === undefined
+          ? "unbounded"
+          : maxTokensOutcome === "enforced" ? "enforced" : "ignored";
+        const requestedReason = requestedOutcome === "enforced"
+          ? "driver-admitted-requested-bound"
+          : requestedOutcome === "ignored"
+            ? "backend-does-not-enforce-requested-bound"
+            : "no-output-token-bound-requested";
+        const grant: SessionDriverResponseAdmission = checked.maxTokens === undefined
           ? Object.freeze({
               ...grantBase,
-              outcome: "enforced",
-              reason: "driver-admitted-requested-bound",
+              outcome: "unbounded",
+              reason: "no-output-token-bound-requested",
             })
-          : Object.freeze({
-              ...grantBase,
-              outcome: "not-enforced",
-              reason: "backend-does-not-enforce-requested-bound",
-            });
+          : requestedOutcome === "enforced"
+            ? Object.freeze({
+                ...grantBase,
+                maxTokens: checked.maxTokens,
+                outcome: "enforced",
+                reason: "driver-admitted-requested-bound",
+              })
+            : Object.freeze({
+                ...grantBase,
+                maxTokens: checked.maxTokens,
+                outcome: "ignored",
+                reason: "backend-does-not-enforce-requested-bound",
+              });
         const key = admissionKey(
           checked.operationId, checked.accountId, checked.sessionId, checked.kind, checked.maxTokens, checked.policy,
         );
@@ -1824,10 +1835,10 @@ async function createSessionDriver(
           operationId: checked.operationId,
           accountId: checked.accountId,
           sessionId: checked.sessionId,
-          maxTokens: checked.maxTokens,
+          ...(checked.maxTokens === undefined ? {} : { maxTokens: checked.maxTokens }),
           policy: checked.policy,
-          outcome: maxTokensOutcome,
-          reason: maxTokensReason,
+          outcome: requestedOutcome,
+          reason: requestedReason,
           signal: checked.signal,
           onAbort,
         });
@@ -1836,7 +1847,6 @@ async function createSessionDriver(
         return grant;
       },
       async dispatch(operation) {
-        if (!maxTokensOutcome) throw unsupported(UNSUPPORTED_PROMPT_MESSAGE);
         let acknowledgement: SessionDriverAcknowledgement | undefined;
         for await (const event of promptEvents(operation)) {
           if (event.type === "complete") acknowledgement = event.acknowledgement;
@@ -1845,11 +1855,9 @@ async function createSessionDriver(
         return acknowledgement;
       },
       async *stream(operation) {
-        if (!maxTokensOutcome) throw unsupported(UNSUPPORTED_PROMPT_MESSAGE);
         yield* promptEvents(operation);
       },
       async continueTools(continuation) {
-        if (!maxTokensOutcome) throw unsupported(UNSUPPORTED_PROMPT_MESSAGE);
         let acknowledgement: SessionDriverAcknowledgement | undefined;
         for await (const event of continuePromptEvents(continuation)) {
           if (event.type === "complete") acknowledgement = event.acknowledgement;
@@ -1858,11 +1866,9 @@ async function createSessionDriver(
         return acknowledgement;
       },
       async prepareToolContinuation(continuation) {
-        if (!maxTokensOutcome) throw unsupported(UNSUPPORTED_PROMPT_MESSAGE);
         preparePromptContinuation(continuation);
       },
       async *streamTools(continuation) {
-        if (!maxTokensOutcome) throw unsupported(UNSUPPORTED_PROMPT_MESSAGE);
         yield* continuePromptEvents(continuation);
       },
       async bindCallerTools(server, binding) {
@@ -1927,24 +1933,35 @@ async function createSessionDriver(
       operationId: string,
       accountId: string,
       sessionId: string,
-      maxTokens: number,
+      maxTokens: number | undefined,
       policy: MaxTokensPolicy,
       signal: AbortSignal,
       admissionValue: unknown,
     ): void {
+      const hasMaxTokens = isRecord(admissionValue) && Object.hasOwn(admissionValue, "maxTokens");
+      const expectedOutcome = maxTokens === undefined
+        ? "unbounded"
+        : maxTokensOutcome === "enforced" ? "enforced" : "ignored";
+      const expectedReason = expectedOutcome === "enforced"
+        ? "driver-admitted-requested-bound"
+        : expectedOutcome === "ignored"
+          ? "backend-does-not-enforce-requested-bound"
+          : "no-output-token-bound-requested";
       if (!isRecord(admissionValue) || !exactKeys(admissionValue, [
-        "kind", "operationId", "accountId", "sessionId", "maxTokens", "policy", "outcome", "reason",
+        "kind", "operationId", "accountId", "sessionId", "policy", "outcome", "reason",
+        ...(hasMaxTokens ? ["maxTokens"] : []),
       ]) || admissionValue.kind !== kind || admissionValue.operationId !== operationId ||
           admissionValue.accountId !== accountId || admissionValue.sessionId !== sessionId ||
-          admissionValue.maxTokens !== maxTokens || admissionValue.policy !== policy ||
-          admissionValue.outcome !== maxTokensOutcome || admissionValue.reason !== maxTokensReason) {
+          (maxTokens === undefined ? hasMaxTokens : admissionValue.maxTokens !== maxTokens) ||
+          admissionValue.policy !== policy || admissionValue.outcome !== expectedOutcome ||
+          admissionValue.reason !== expectedReason) {
         throw unsupported("The ACP response has no matching per-response admission grant.");
       }
       const key = admissionKey(operationId, accountId, sessionId, kind, maxTokens, policy);
       const grant = admissions.get(key);
       if (!grant || grant.kind !== kind || grant.operationId !== operationId || grant.accountId !== accountId ||
           grant.sessionId !== sessionId || grant.maxTokens !== maxTokens || grant.policy !== policy ||
-          grant.outcome !== maxTokensOutcome || grant.reason !== maxTokensReason || grant.signal !== signal) {
+          grant.outcome !== expectedOutcome || grant.reason !== expectedReason || grant.signal !== signal) {
         throw unsupported("The ACP response admission grant is missing, mismatched, or already consumed.");
       }
       admissions.delete(key);
@@ -1956,12 +1973,14 @@ async function createSessionDriver(
     ): void {
       if (!isRecord(continuation) || !exactKeys(continuation, [
         "operationId", "previousOperationId", "accountId", "sessionId", "configuration",
-        "messages", "maxTokens", "admission", "results", "signal",
+        "messages", "admission", "results", "signal",
+        ...(Object.hasOwn(continuation, "maxTokens") ? ["maxTokens"] : []),
       ]) || continuation.accountId !== context.accountId ||
           continuation.sessionId !== context.sessionId || continuation.configuration !== context.configuration ||
           typeof continuation.operationId !== "string" || continuation.operationId.length === 0 ||
           typeof continuation.previousOperationId !== "string" || !isAbortSignal(continuation.signal) ||
-          !Number.isSafeInteger(continuation.maxTokens) || continuation.maxTokens < 1 ||
+          (Object.hasOwn(continuation, "maxTokens") &&
+            (!Number.isSafeInteger(continuation.maxTokens) || (continuation.maxTokens as number) < 1)) ||
           !Array.isArray(continuation.messages) || !Array.isArray(continuation.results)) {
         throw new InvalidRequestError("The ACP tool continuation is malformed or belongs to another session.");
       }
@@ -1995,7 +2014,8 @@ async function createSessionDriver(
       if (!isRecord(operation) || operation.accountId !== context.accountId || operation.sessionId !== context.sessionId ||
           operation.configuration !== context.configuration || typeof operation.operationId !== "string" ||
           operation.operationId.length === 0 || !isAbortSignal(operation.signal) ||
-          !Number.isSafeInteger(operation.maxTokens) || (operation.maxTokens as number) < 1 ||
+          (Object.hasOwn(operation, "maxTokens") &&
+            (!Number.isSafeInteger(operation.maxTokens) || (operation.maxTokens as number) < 1)) ||
           !Array.isArray(operation.acpPrompt) || operation.acpPrompt.length === 0 ||
           operation.acpPrompt.some((block) => !isRecord(block) || !exactKeys(block, ["type", "text"]) ||
             block.type !== "text" || typeof block.text !== "string")) {
@@ -2008,7 +2028,7 @@ async function createSessionDriver(
       }
       consumeAdmission(
         "prompt", operation.operationId, operation.accountId, operation.sessionId,
-        operation.maxTokens as number, context.maxTokensPolicy, operation.signal, operation.admission,
+        operation.maxTokens, context.maxTokensPolicy, operation.signal, operation.admission,
       );
 
       const mcpServer = boundServer && boundToolBinding
@@ -2337,7 +2357,7 @@ function admissionKey(
   accountId: string,
   sessionId: string,
   kind: "prompt" | "tool_continuation",
-  maxTokens: number,
+  maxTokens: number | undefined,
   policy: MaxTokensPolicy,
 ): string {
   return `${accountId}\0${sessionId}\0${operationId}\0${kind}\0${maxTokens}\0${policy}`;
@@ -2371,14 +2391,11 @@ function findModelSelector(created: Record<string, unknown>): { readonly id: str
 }
 
 function modelOptions(selector: { readonly options: readonly unknown[] }): readonly string[] {
-  const values: string[] = [];
-  for (const option of selector.options) {
-    if (!isRecord(option) || typeof option.value !== "string" || option.value.length === 0) {
-      throw new ProtocolFailureError("ACP returned malformed model configuration options.");
-    }
-    values.push(option.value);
-  }
-  return values;
+  return extractAcpAdvertisedModels([{
+    id: "model",
+    category: "model",
+    options: selector.options,
+  }]).map(({ id }) => id);
 }
 
 function selectedModelFrom(response: unknown, configId: string): string | undefined {

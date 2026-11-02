@@ -478,12 +478,17 @@ function validateAdmissionGrant(
   if (!isRecord(cloned)) throw invalidWorkerResult();
   const identityMatches = cloned.kind === request.kind && cloned.operationId === request.operationId &&
     cloned.accountId === request.accountId && cloned.sessionId === request.sessionId &&
-    cloned.maxTokens === request.maxTokens;
+    (request.maxTokens === undefined
+      ? !hasOwn(cloned, "maxTokens")
+      : cloned.maxTokens === request.maxTokens);
   const expectedReason = expectedOutcome === "enforced"
     ? "driver-admitted-requested-bound"
-    : "backend-does-not-enforce-requested-bound";
+    : expectedOutcome === "ignored"
+      ? "backend-does-not-enforce-requested-bound"
+      : "no-output-token-bound-requested";
   const exactGrant = exactKeys(cloned, [
-    "kind", "operationId", "accountId", "sessionId", "maxTokens", "policy", "outcome", "reason",
+    "kind", "operationId", "accountId", "sessionId", "policy", "outcome", "reason",
+    ...(request.maxTokens === undefined ? [] : ["maxTokens"]),
   ]);
   if (!identityMatches || !exactGrant || cloned.policy !== request.policy ||
       cloned.outcome !== expectedOutcome || cloned.reason !== expectedReason) {
@@ -494,12 +499,15 @@ function validateAdmissionGrant(
     operationId: request.operationId,
     accountId: request.accountId,
     sessionId: request.sessionId,
-    maxTokens: request.maxTokens,
     policy: request.policy,
   };
+  if (expectedOutcome === "unbounded") {
+    return Object.freeze({ ...base, outcome: "unbounded" as const, reason: "no-output-token-bound-requested" as const });
+  }
+  if (request.maxTokens === undefined) throw invalidWorkerResult();
   return expectedOutcome === "enforced"
-    ? Object.freeze({ ...base, outcome: "enforced" as const, reason: "driver-admitted-requested-bound" as const })
-    : Object.freeze({ ...base, outcome: "not-enforced" as const, reason: "backend-does-not-enforce-requested-bound" as const });
+    ? Object.freeze({ ...base, maxTokens: request.maxTokens, outcome: "enforced" as const, reason: "driver-admitted-requested-bound" as const })
+    : Object.freeze({ ...base, maxTokens: request.maxTokens, outcome: "ignored" as const, reason: "backend-does-not-enforce-requested-bound" as const });
 }
 
 function enforcementDiagnostic(
@@ -510,24 +518,15 @@ function enforcementDiagnostic(
     sessionId: admission.sessionId,
     operationId: admission.operationId,
     kind: admission.kind,
-    requestedMaxTokens: admission.maxTokens,
     policy: admission.policy,
   };
-  return admission.outcome === "enforced"
-    ? Object.freeze({ ...base, outcome: "enforced" as const, reason: "driver-admitted-requested-bound" as const })
-    : Object.freeze({ ...base, outcome: "not-enforced" as const, reason: "backend-does-not-enforce-requested-bound" as const });
-}
-
-function rejectUnenforcedMaxTokensStop(
-  acknowledgement: SessionDriverAcknowledgement,
-  admission: SessionDriverResponseAdmission,
-): void {
-  if (admission.outcome === "not-enforced" && isRecord(acknowledgement.result) &&
-      acknowledgement.result.stopReason === "max_tokens") {
-    throw new UnsupportedFeatureError(
-      "The ACP max_tokens stop reason cannot be attributed to the requested bound when that bound was not enforced.",
-    );
+  if (admission.maxTokens !== undefined) {
+    const requested = { ...base, requestedMaxTokens: admission.maxTokens };
+    return admission.outcome === "enforced"
+      ? Object.freeze({ ...requested, outcome: "enforced" as const, reason: "driver-admitted-requested-bound" as const })
+      : Object.freeze({ ...requested, outcome: "ignored" as const, reason: "backend-does-not-enforce-requested-bound" as const });
   }
+  return Object.freeze({ ...base, outcome: "unbounded" as const, reason: "no-output-token-bound-requested" as const });
 }
 
 function normalizeWorkerError(error: unknown): Error {
@@ -685,13 +684,10 @@ class SessionLedgerImpl implements SessionLedger {
       if (declaredCapabilities.streaming === "incremental" && typeof driver.stream !== "function") {
         throw invalidWorkerResult();
       }
-      const admitsMaxTokens = typeof driver.admitResponse === "function" &&
-        (declaredCapabilities.maxTokens === "enforced" ||
-          (declaredCapabilities.maxTokens === "not-enforced" &&
-            this.#maxTokensPolicy === "allow-unenforced-max-tokens"));
+      const admitsMaxTokens = typeof driver.admitResponse === "function";
       this.driverCapabilitiesValue = Object.freeze({
-        ...(admitsMaxTokens
-          ? { maxTokens: declaredCapabilities.maxTokens! }
+        ...(admitsMaxTokens && declaredCapabilities.maxTokens !== undefined
+          ? { maxTokens: declaredCapabilities.maxTokens }
           : {}),
         ...(declaredCapabilities.streaming === "incremental" ? { streaming: "incremental" as const } : {}),
       });
@@ -1138,7 +1134,7 @@ class SessionLedgerImpl implements SessionLedger {
 
   private startToolContinuation(
     accepted: AcceptedToolBatch,
-    maxTokens: number,
+    maxTokens: number | undefined,
     externalSignal: AbortSignal | undefined,
     streaming = false,
   ): { readonly continuation: SessionDriverToolContinuationPlan; readonly externalSignal: AbortSignal | undefined; readonly abortFromCaller: () => void } {
@@ -1166,7 +1162,7 @@ class SessionLedgerImpl implements SessionLedger {
       sessionId: this.sessionId,
       configuration: this.configuration,
       messages: accepted.messages,
-      maxTokens,
+      ...(maxTokens === undefined ? {} : { maxTokens }),
       results: accepted.results,
       signal: controller.signal,
     });
@@ -1176,7 +1172,7 @@ class SessionLedgerImpl implements SessionLedger {
   private async admitMessageResponse(
     kind: SessionDriverResponseAdmissionRequest["kind"],
     operationId: string,
-    maxTokens: number,
+    maxTokens: number | undefined,
     signal: AbortSignal,
   ): Promise<SessionDriverResponseAdmission> {
     if (typeof this.driver?.admitResponse !== "function") {
@@ -1188,17 +1184,16 @@ class SessionLedgerImpl implements SessionLedger {
       operationId,
       accountId: this.accountId,
       sessionId: this.sessionId,
-      maxTokens,
+      ...(maxTokens === undefined ? {} : { maxTokens }),
       policy: this.#maxTokensPolicy,
       signal,
     });
     const admissionPromise = Promise.resolve().then(() => this.driver!.admitResponse!(request));
     const grant = await waitForSignal(admissionPromise, signal);
     if (signal.aborted || this.isClosed()) throw aborted();
-    const expectedOutcome = this.driverCapabilitiesValue.maxTokens;
-    if (!expectedOutcome) {
-      throw new UnsupportedFeatureError("The session worker does not implement an admitted max_tokens policy.");
-    }
+    const expectedOutcome = maxTokens === undefined
+      ? "unbounded"
+      : this.driverCapabilitiesValue.maxTokens === "enforced" ? "enforced" : "ignored";
     const admission = validateAdmissionGrant(grant, request, expectedOutcome);
     this.maxTokensEnforcementValue = enforcementDiagnostic(admission);
     return admission;
@@ -1265,7 +1260,9 @@ class SessionLedgerImpl implements SessionLedger {
     suffix: SessionTranscript,
     options: SessionLedgerMessageOptions,
   ): Promise<SessionLedgerReceipt> {
-    if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens < 1) throw invalidRequest();
+    if (options.maxTokens !== undefined && (!Number.isSafeInteger(options.maxTokens) || options.maxTokens < 1)) {
+      throw invalidRequest();
+    }
     const accepted = this.validateToolResultBatch(fullTranscript, suffix);
     const started = this.startToolContinuation(accepted, options.maxTokens, options.signal);
     const active = this.runToolContinuation(started.continuation, accepted, started.externalSignal, started.abortFromCaller);
@@ -1303,7 +1300,6 @@ class SessionLedgerImpl implements SessionLedger {
       const raw = await this.driver!.continueTools!(continuation);
       if (continuation.signal.aborted || this.isClosed()) throw aborted();
       const acknowledgement = validateWorkerAcknowledgement(raw);
-      rejectUnenforcedMaxTokensStop(acknowledgement, admission);
       const normalized = await this.prepareMessageAcknowledgement(
         acknowledgement,
         continuation.operationId,
@@ -1414,8 +1410,8 @@ class SessionLedgerImpl implements SessionLedger {
     request: SessionLedgerRequest,
     options: SessionLedgerMessageOptions,
   ): Promise<SessionLedgerReceipt> {
-    if (!this.driverCapabilitiesValue.maxTokens || typeof this.driver?.admitResponse !== "function") {
-      throw new UnsupportedFeatureError("The session driver has not implemented max_tokens response admission.");
+    if (typeof this.driver?.admitResponse !== "function") {
+      throw new UnsupportedFeatureError("The session worker has not implemented operation-bound Messages admission.");
     }
     if (!options || typeof options !== "object" || Array.isArray(options)) throw invalidRequest();
     const keys = Reflect.ownKeys(options);
@@ -1427,7 +1423,9 @@ class SessionLedgerImpl implements SessionLedger {
       if (!descriptor?.enumerable || !("value" in descriptor)) throw invalidRequest();
     }
     validateSignal(options.signal);
-    if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens < 1) throw invalidRequest();
+    if (options.maxTokens !== undefined && (!Number.isSafeInteger(options.maxTokens) || options.maxTokens < 1)) {
+      throw invalidRequest();
+    }
 
     const checkedRequest = cloneJson(request, invalidRequest);
     if (
@@ -1460,7 +1458,7 @@ class SessionLedgerImpl implements SessionLedger {
     };
     return this.executeOperation(normalizedRequest, { ...(options.signal === undefined ? {} : { signal: options.signal }) }, {
       acpPrompt,
-      maxTokens: options.maxTokens,
+      ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
     });
   }
 
@@ -1469,12 +1467,11 @@ class SessionLedgerImpl implements SessionLedger {
     options: SessionLedgerMessageOptions,
   ): AsyncIterable<SessionMessageSemanticEvent> {
     if (
-      !this.driverCapabilitiesValue.maxTokens ||
       this.driverCapabilitiesValue.streaming !== "incremental" ||
       typeof this.driver?.admitResponse !== "function" ||
       typeof this.driver?.stream !== "function"
     ) {
-      throw new UnsupportedFeatureError("The session driver has not implemented bounded incremental Messages response admission.");
+      throw new UnsupportedFeatureError("The session driver has not implemented incremental operation-bound Messages admission.");
     }
     if (!options || typeof options !== "object" || Array.isArray(options)) throw invalidRequest();
     const keys = Reflect.ownKeys(options);
@@ -1484,7 +1481,9 @@ class SessionLedgerImpl implements SessionLedger {
       if (!descriptor?.enumerable || !("value" in descriptor)) throw invalidRequest();
     }
     validateSignal(options.signal);
-    if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens < 1) throw invalidRequest();
+    if (options.maxTokens !== undefined && (!Number.isSafeInteger(options.maxTokens) || options.maxTokens < 1)) {
+      throw invalidRequest();
+    }
 
     const checkedRequest = cloneJson(request, invalidRequest);
     if (
@@ -1533,7 +1532,7 @@ class SessionLedgerImpl implements SessionLedger {
     options: SessionLedgerOperationOptions,
     messageOperation?: {
       readonly acpPrompt: NonNullable<SessionDriverOperation["acpPrompt"]>;
-      readonly maxTokens: number;
+      readonly maxTokens?: number;
     },
   ): Promise<SessionLedgerReceipt> {
     this.assertCanExecute();
@@ -1577,7 +1576,7 @@ class SessionLedgerImpl implements SessionLedger {
     externalSignal: AbortSignal | undefined,
     messageOperation?: {
       readonly acpPrompt: NonNullable<SessionDriverOperation["acpPrompt"]>;
-      readonly maxTokens: number;
+      readonly maxTokens?: number;
     },
   ): {
     readonly operation: SessionDriverOperation;
@@ -1605,7 +1604,7 @@ class SessionLedgerImpl implements SessionLedger {
       messages: suffix,
       ...(messageOperation === undefined ? {} : {
         acpPrompt: messageOperation.acpPrompt,
-        maxTokens: messageOperation.maxTokens,
+        ...(messageOperation.maxTokens === undefined ? {} : { maxTokens: messageOperation.maxTokens }),
       }),
       signal: controller.signal,
     });
@@ -1808,7 +1807,6 @@ class SessionLedgerImpl implements SessionLedger {
     try {
       let admittedOperation = operation;
       if (isMessageOperation) {
-        if (operation.maxTokens === undefined) throw invalidWorkerResult();
         const admission = await this.admitMessageResponse(
           "prompt",
           operation.operationId,
@@ -1828,7 +1826,6 @@ class SessionLedgerImpl implements SessionLedger {
       let messageResult: NormalizedMessagesAcknowledgement | undefined;
       if (isMessageOperation) {
         if (!admittedResponse) throw invalidWorkerResult();
-        rejectUnenforcedMaxTokensStop(acknowledgement, admittedResponse);
         messageResult = await this.prepareMessageAcknowledgement(acknowledgement, operation.operationId);
         acknowledgement = Object.freeze({ ...acknowledgement, output: messageResult.output });
       }
@@ -1907,7 +1904,7 @@ class SessionLedgerImpl implements SessionLedger {
   private runMessageStream(
     suffix: SessionTranscript,
     acpPrompt: NonNullable<SessionDriverOperation["acpPrompt"]>,
-    maxTokens: number,
+    maxTokens: number | undefined,
     externalSignal: AbortSignal | undefined,
     expectedRevision: number,
     continuationTranscript?: SessionTranscript,
@@ -1935,7 +1932,10 @@ class SessionLedgerImpl implements SessionLedger {
             continuationPlan = startedContinuation.continuation;
             started = { ...startedContinuation, operation: continuationPlan };
           } else {
-            const startedOperation = core.startOperation(suffix, externalSignal, { acpPrompt, maxTokens });
+            const startedOperation = core.startOperation(suffix, externalSignal, {
+              acpPrompt,
+              ...(maxTokens === undefined ? {} : { maxTokens }),
+            });
             started = { ...startedOperation, operation: startedOperation.operation };
           }
           let operation: SessionDriverOperation | SessionDriverToolContinuationPlan = started.operation;
@@ -2084,7 +2084,6 @@ class SessionLedgerImpl implements SessionLedger {
           core.activateToolContinuation(continuation.operationId);
         } else {
           const promptOperation = operation as SessionDriverOperation;
-          if (promptOperation.maxTokens === undefined) throw invalidWorkerResult();
           const admission = await core.admitMessageResponse(
             "prompt",
             promptOperation.operationId,
@@ -2156,7 +2155,6 @@ class SessionLedgerImpl implements SessionLedger {
           completed = true;
           finalAcknowledgement = event.acknowledgement;
           if (!admittedResponse) throw invalidWorkerResult();
-          rejectUnenforcedMaxTokensStop(finalAcknowledgement, admittedResponse);
           const resultPayload = finalAcknowledgement.result;
           toolBoundaryAcknowledged = finalAcknowledgement.stage === "awaiting_tools" ||
             (isRecord(resultPayload) && resultPayload.stopReason === "tool_use");

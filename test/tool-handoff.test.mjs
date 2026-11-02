@@ -162,10 +162,12 @@ async function harness(root, callbacks = {}, { accountCount = 1, mcpLimits } = {
               operationId: request.operationId,
               accountId: request.accountId,
               sessionId: request.sessionId,
-              maxTokens: request.maxTokens,
+              ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
               policy: request.policy,
-              outcome: "enforced",
-              reason: "driver-admitted-requested-bound",
+              outcome: request.maxTokens === undefined ? "unbounded" : "enforced",
+              reason: request.maxTokens === undefined
+                ? "no-output-token-bound-requested"
+                : "driver-admitted-requested-bound",
             };
             const customGrant = await callbacks.admitResponse?.(i, request, sessions[i], driver);
             return customGrant ?? grant;
